@@ -1,5 +1,32 @@
 # Credential Provider Plugin Protocol for Secure NPM Authentication
 
+## Table of Contents
+
+- [Summary](#summary)
+- [Motivation](#motivation)
+  - [Goals](#goals)
+  - [Non-Goals](#non-goals)
+- [Detailed Explanation](#detailed-explanation)
+  - [How it works (high level)](#how-it-works-high-level)
+  - [Key components](#key-components)
+- [Rationale and Alternatives](#rationale-and-alternatives)
+- [Implementation](#implementation)
+  - [Plugin Discovery](#plugin-discovery)
+  - [Protocol](#protocol)
+    - [Request kinds](#request-kinds)
+    - [`get` request](#get-request)
+    - [`get` success response](#get-success-response)
+    - [`login` request](#login-request)
+    - [`logout` request](#logout-request)
+    - [Error response](#error-response)
+    - [Timeout and retry](#timeout-and-retry)
+  - [Caching](#caching)
+  - [Example flows](#example-flows)
+- [Security Considerations](#security-considerations)
+- [Prior Art](#prior-art)
+- [Unresolved Questions and Bikeshedding](#unresolved-questions-and-bikeshedding)
+- [Acknowledgments](#acknowledgments)
+
 ## Summary
 
 This RFC proposes the implementation of a credential provider plugin protocol
@@ -30,7 +57,7 @@ and similar controls) without compromising developer experience.
 - Enable runtime token acquisition via a standardized provider interface.
 - Support short-lived tokens without manual rotation.
 - Support scoped registries and multiple registry configurations.
-- Support third-party registry authentication using npm cli and third-party
+- Support third-party registry authentication using npm CLI and third-party
   credential providers.
 - Preserve graceful fallback behavior if no provider is available.
 
@@ -41,6 +68,10 @@ and similar controls) without compromising developer experience.
 - Define a universal keychain-based storage requirement for Node tooling
   (providers may use OS keychains or brokers internally).
 - Persist returned tokens to disk (explicitly avoided).
+- Reintroduce a pre/post-install script vector or enable execution of untrusted
+  arbitrary binaries. This protocol is a narrowly scoped, user-controlled
+  auth hook — not a general-purpose plugin system.
+
 
 ## Detailed Explanation
 
@@ -52,43 +83,55 @@ configured credential provider at runtime and receives a token in response.
 This design avoids persisting tokens in `.npmrc` or relying on environment
 variables as a long-term secret store. When a credential provider is
 configured for a registry, that provider becomes the authoritative auth source
-for that registry. npm must fail closed on provider errors and must not silently
-downgrade back to legacy auth sources.
+for that registry. If provider resolution or execution fails, npm may fall
+back to legacy auth sources, but it must emit an explicit warning that auth
+downgraded from credential provider mode.
 
 ### How it works (high level)
 
 1. **Registry request requires auth**: NPM determines that a request to a
    registry requires authentication (install, publish, and similar operations).
-2. **Plugin discovery**: NPM finds, resolves, and performs integrity checks for
-   the credential provider configured for the target registry.
-3. **Invoke provider**: NPM spawns the provider as a child process, writes a
-   JSON request with relevant runtime context information to `stdin`,
-   and reads a JSON response from `stdout`. When
-   multiple registries require credentials, npm serializes provider
-   invocations (one at a time) to avoid overlapping interactive prompts.
+2. **Plugin discovery**: NPM finds and resolves the ordered list of
+   credential providers configured for the target registry. This happens once
+   per registry per command, regardless of how many workspace members need
+   that registry.
+3. **Invoke provider**: NPM spawns the first provider as a child process,
+   writes a JSON request to `stdin`, then closes the write end (sends EOF).
+   The provider writes a JSON response to `stdout`, then exits. If the
+   provider returns an error with kind `"url-not-supported"`, npm tries the
+   next provider in the list. npm serializes provider invocations to avoid
+   overlapping prompts and ambiguous-account errors.
 4. **Use token in-memory**: NPM uses the returned token for the outgoing HTTP
    request without writing it to disk.
 5. **Provider-owned token lifecycle**: NPM keeps a process-lifetime
-   in-memory cache of provider responses (see [Caching](#caching)),
-   while token caching and refresh policy are owned by the credential provider.
+   in-memory cache of provider responses (see [Caching](#caching)).
+   The cache ensures the provider is typically spawned only once per
+   registry per npm command. Token caching and
+   refresh policy beyond the current process are owned by the provider.
 6. **Failure handling**: If no provider is configured, NPM continues with
-   existing credential behavior. If a provider is configured but fails, NPM
-   surfaces the provider error and fails the npm command for that auth context;
-   it must not fall back to legacy sources for that registry.
+   existing credential behavior. If a provider is configured but fails during
+   a `get` or `logout` request, NPM warns and falls back to legacy credential
+   behavior. If a provider fails during a `login` request, NPM hard-fails —
+   falling back would persist a plaintext token to `.npmrc`.
 
 ### Key components
 
 #### Host (npm CLI)
 
 - Decide when credential providers are invoked.
-- Resolve the provider for the target registry.
-- Resolve configuration and pass it to the provider via `stdin` JSON.
-- Declare the protocol version (`v`) in every request — no negotiation handshake.
-- Serialize provider invocations per registry (one at a time).
+- Resolve the ordered provider list for the target registry.
+- Try providers in configured order; advance on `"url-not-supported"` errors.
+- Resolve and pass request context to the provider via `stdin` JSON.
+- Declare the protocol version (`v`) in every request — no negotiation
+  handshake.
+- Serialize provider invocations (one at a time) — even in non-interactive
+  mode — for deterministic fallback and clear account-ambiguity diagnostics.
 - Use returned credentials in-memory only.
-- Enforce retry, timeout, redirect, and logging policy.
-- Make available appropriate logging/tracing messages for use and support efforts.
-- Never fall back to legacy auth when a provider is configured.
+- Enforce retry limits and timeout; kill the provider on expiry.
+- Never log credentials, tokens, or authorization headers.
+- When provider execution fails on `get` or `logout`, fall back to legacy
+  auth with an explicit warning. When provider execution fails on `login`,
+  hard-fail — no fallback.
 
 #### Plugin (credential provider)
 
@@ -96,7 +139,6 @@ downgrade back to legacy auth sources.
 - Own token caching and refresh policy.
 - Validate the declared protocol version (`v`) on every request — fail
   immediately if unsupported.
-- Handle account selection; fail safely when selection is ambiguous.
 - Ignore unknown request fields (forward compatibility).
 - Return credentials in a structured response shape.
 - Return structured errors when credential acquisition fails.
@@ -117,8 +159,20 @@ downgrade back to legacy auth sources.
    - No versioning or update detection.
    - Shell injection risk if command string passes through shell parsing.
    - No discoverability or ecosystem conventions.
-
-   May be appropriate for local development/testing but not production.
+5. **Long-lived bidirectional process** — Considered. Provider stays alive
+   for the duration of the npm command; npm sends multiple requests on the
+   same stdin/stdout stream. Amortizes startup cost and enables richer
+   protocol features (refresh, batch). Not recommended for v1:
+   - In-memory cache already limits spawns to 1-2 per registry per command.
+   - Adds process lifecycle management (crash detection, reconnection,
+     graceful shutdown) to both npm and every provider implementation.
+   - Requires message framing (length-prefix or newline-delimited JSON) —
+     one-shot uses EOF as the natural delimiter.
+   - Each request is an isolated process — no corrupted state carries over
+     from a previous failure.
+   - Provider implementation reduces to: read stdin, write stdout, exit.
+   - Git credential helpers and NuGet credential providers both use one-shot
+     successfully at massive scale.
 
 The plugin protocol is the most secure and flexible option, aligning with
 prior art (pnpm tokenHelpers, NuGet credential providers, pip keyring,
@@ -128,160 +182,114 @@ Git credential helpers, Cargo credential providers).
 
 ### Plugin Discovery
 
-#### Provider selection via `.npmrc`
+#### Configuration
 
-`.npmrc` stores provider identifiers, not shell commands. Provider selection
-by id:
+The user or global `.npmrc` stores provider identifiers, not shell commands. The value is an
+ordered, comma-separated list of provider ids:
 
-- `credentialProviderId=<id>` (global default)
-- `//<registryHost>:credentialProviderId=<id>` (per-registry)
-- `@scope:credentialProviderId=<id>` (per-scope)
+- `//<registryHost>:credentialProvider=<id>[,<id>...]` (per-registry)
+- `@scope:credentialProvider=<id>[,<id>...]` (per-scope)
+- `credentialProvider=<id>[,<id>...]` (global default)
 
-Resolution precedence: per-registry > per-scope > global default. Scope-level
-configuration is useful when all packages under a scope resolve to the same
-private registry.
+Precedence: per-registry > per-scope > global default.
+
+Only user or global `.npmrc` grants execution trust. `credentialProvider`
+in project `.npmrc` is ignored entirely.
+
+npm tries providers in the order listed. When a provider returns an `Err`
+with kind `"url-not-supported"`, npm advances to the next provider. If all
+providers return `"url-not-supported"`, npm falls back to legacy auth and
+emits a warning. npm does not cache which provider succeeded for a given
+registry; providers are tried in order on every npm command. This
+matches Cargo's credential provider model. Provider-side token caching
+ensures the successful provider returns near-instantly on subsequent
+invocations, so the cost of re-trying the list is negligible in practice.
+
+> **Design note:** NuGet takes a different approach — it caches a
+> per-registry mapping of which provider last succeeded, so subsequent
+> commands skip straight to the winning provider. This avoids re-trying the
+> list but adds host-side state management. The Cargo model is simpler and
+> avoids staleness issues when provider configurations change.
 
 Example:
 
 ```ini
-//registry.example.com:credentialProviderId=corp-provider
-@corp:credentialProviderId=corp-provider
+# ~/.npmrc
+
+# Global default — applies to all registries unless overridden
+credentialProvider=@corp/credprovider,@backup/credprovider
+
+# Per-registry — overrides global default for this registry
+//registry.example.com:credentialProvider=@corp/credprovider
+//registry.example.com:credentialProviderAccountHint=user@corp.com
+
+# Per-scope — overrides global default for @corp packages
+@corp:credentialProvider=@corp/credprovider
 ```
 
-All `credentialProvider*` nerf-darted keys must be added to npm's allow-list
-(`nerfDarts` in `workspaces/config/lib/definitions/index.js`) so npm does not
-emit "unknown config" warnings.
+#### Provider Binary Resolution
 
-#### Provider id to executable resolution
+The provider reference in user/global `.npmrc` must be a provider package
+name resolved from npm-managed global install locations.
 
-The provider id is the npm package name. Credential providers expose a CLI
-executable via `bin` in their `package.json`. npm resolves the executable via
-the path + SHA-256 hash recorded during `npm credential-provider trust`.
+npm must never resolve providers from `$PATH` or project `node_modules`.
 
-The resolved executable must pass a hash integrity check before every spawn.
+Adding the provider to user/global `.npmrc` **is** the trust decision — the
+same model as Git and Docker credential helpers.
 
-On Windows, globally installed npm packages create `.cmd` shims in the global
-prefix bin directory (e.g. `%APPDATA%\npm\<provider-bin-name>.cmd`), which
-npm uses as the executable path.
+The provider must be installable from a trusted source that does not itself
+require the provider (public registry, local package source with global
+install, or enterprise bootstrap script).
 
-This resolution logic is **new behavior** specific to credential providers.
-npm's existing package resolution does not perform hash-based integrity checks.
-This is intentional — credential providers occupy a higher trust tier because
-they handle authentication secrets.
-
-#### Installation and registration
-
-Installation and registration are distinct steps:
-
-1. **Installation** (`npm install -g <id>` or `npm install <id>`): Places the
-   package on disk and creates the `bin` shim. Installation alone does **not**
-   grant trust.
-
-2. **Registration** — a new `npm credential-provider trust <id>` subcommand
-   (does not exist yet; prerequisite for shipping this feature):
-   - Resolves the installed provider's `bin` entry to an absolute path.
-   - Computes SHA-256 of the resolved executable.
-   - Displays path, version, and hash for user confirmation.
-   - Records the path + hash in user/global npm config.
-   - This is the only mechanism that grants spawn trust.
-
-   Re-registration is required after every provider update — intentional
-   friction. In npm's ecosystem, silent upgrades are exactly how supply-chain
-   attacks land (maintainer account takeover → patch release →
-   auto-installed). Requiring an explicit trust step makes this detectable.
-
-**Bootstrap constraint:** The provider must be installable from a source that
-does not itself require the provider for authentication. This is not a
-limitation — it's the correct trust boundary, matching every credential helper
-ecosystem (Git, Docker, Cargo). Recommended distribution paths:
-- Publish to the public npm registry (npmjs.org).
-- Provide an OS-native installer (MSI, pkg, deb).
-- Enterprise bootstrap script that installs from an unauthenticated endpoint.
-
-Example:
-
-```bash
-npm install -g @corp/credprovider --registry https://registry.npmjs.org
-npm credential-provider trust @corp/credprovider
-```
-
-```ini
-//registry.example.com:credentialProviderId=@corp/credprovider
-```
-
-**Automatic discovery (rejected):** Scanning well-known directories (similar
-to [.NET global tools](https://learn.microsoft.com/dotnet/core/tools/dotnet-tool-install#installation-locations))
-was rejected — writable discovery paths become planting vectors, spawning
-unknown binaries violates fail-closed, and hash integrity requires a deliberate
-registration step that auto-discovery bypasses.
-
-### Invoking the Credential Provider
-
-When npm requires credentials for a registry request:
-
-1. Provider invocation, if a provider is configured for the target registry.
-2. Existing credential sources only when no provider is configured.
-
-#### Protocol
+### Protocol
 
 Providers are executed as a child process using a `stdin`/`stdout` JSON
 protocol:
 
-- npm spawns the registered provider executable with no command-line arguments.
-  On Unix, spawned directly without a shell. On Windows, `.cmd` shims require
-  shell-based spawning.
+- npm spawns the provider executable with no command-line arguments and
+  no shell interpolation.
 - npm writes exactly one UTF-8 JSON request to `stdin`, then closes the write
   end (sends EOF).
-- The provider writes exactly one UTF-8 JSON response to `stdout`.
+- The provider writes exactly one UTF-8 JSON response to `stdout`, then
+  exits.
 - `stderr` is reserved for diagnostic logging — npm streams it to the user
   per loglevel but never parses it.
-- Exit code 0 + recognized credential fields = success. Non-zero exit =
-  failure (JSON body carries error details if valid).
-- npm must not fall back to `.npmrc`, `NPM_TOKEN`, or other legacy auth when a
-  provider is configured. Provider failure = npm command failure.
-- When multiple registries need credentials, npm serializes invocations to
-  prevent overlapping interactive prompts.
+- Exit code 0 + recognized `Ok` response = success. Non-zero exit or `Err`
+  response = failure.
+- npm enforces a per-request-kind timeout (see [Timeout and retry](#timeout-and-retry)).
+  On expiry, npm kills the process and treats it as failure. Configurable via
+  `credentialProviderTimeoutMs` in user/global `.npmrc`.
 
 This follows [Cargo's credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html)
-— structured communication via `stdin`/`stdout`, `stderr` for diagnostics.
+— structured communication via `stdin`/`stdout`, `stderr` for diagnostics —
+adapted to a one-shot spawn model similar to NuGet credential providers and
+Git credential helpers.
 
-#### Configuration passed to providers
+#### Request kinds
 
-npm resolves all configuration so providers do not have to parse `.npmrc`
-files or read npm environment variables. Settings are passed in the request
-JSON:
+| Kind | Required | Purpose |
+|------|----------|---------|
+| `get` | yes | Acquire credentials for a registry request (may be interactive or silent) |
+| `login` | no | Force fresh authentication and persist — hooks into `npm login` |
+| `logout` | no | Remove stored credentials — hooks into `npm logout` |
 
-| npm config key | JSON field | Description |
-|----------------|-----------|-------------|
-| `registry` | `registry` | **Required.** Fully qualified registry base URI. |
-| `loglevel` | `loglevel` | Current npm log verbosity. |
-| `https-proxy` | `network.httpsProxy` | HTTPS proxy URL. |
-| `proxy` | `network.httpProxy` | HTTP proxy URL. |
-| `noproxy` | `network.noProxy` | Comma-separated bypass domains. |
-| `strict-ssl` | `network.strictSsl` | Whether to require SSL cert validation. |
-| `cafile` | `network.caFile` | Path to CA certificate bundle file. |
+Providers must implement `get`. `login` and `logout` are optional — a provider
+that does not support them must return `operation-not-supported`, and npm will
+fall back to its default login/logout behavior (prompting for a token and
+persisting it to `.npmrc`).
 
-Proxy and TLS settings are forwarded because providers may make their own
-outbound HTTP requests (e.g. to an identity provider) and should honor the
-same network configuration as npm.
-
-**Credential-provider-specific settings:**
-
-| Config key | JSON field | Description |
-|------------|-----------|-------------|
-| `credentialProviderInteractive` | `interactive` | Whether prompts are allowed. `true` (default) or `false` for CI. |
-| `credentialProviderTimeoutMs` | *(not passed)* | Max runtime in ms (default `120000`). Enforced externally by npm. |
-| *(set by npm on retry)* | `forceRefresh` | Boolean signal to bypass cache. Defaults to `false`. |
-
-#### Request schema
+#### `get` request
 
 ```json
 {
   "v": 1,
+  "kind": "get",
   "registry": "https://pkgs.dev.azure.com/org/_packaging/feed/npm/registry/",
+  "permission": "read-only",
+  "accountHint": "user@example.com",
   "interactive": true,
-  "loglevel": "info",
-  "forceRefresh": false,
+  "retry": false,
+  "logLevel": "info",
   "network": {
     "httpsProxy": "https://proxy.example.com:8080",
     "httpProxy": "http://proxy.example.com:8080",
@@ -292,174 +300,377 @@ same network configuration as npm.
 }
 ```
 
-Key field semantics:
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `v` | integer | yes | Protocol version. npm declares in every request — no handshake. Major version bump = breaking changes; new optional fields don't require a bump. Provider does not echo the version back. |
+| `kind` | string | yes | Must be `"get"`. |
+| `registry` | string | yes | Fully qualified absolute base URI. Resolved from the nerf-darted config key where the provider was found. |
+| `permission` | string | yes | `"read-only"` (install, view, search) or `"read-write"` (publish, unpublish). Follows npm's existing token permission vocabulary (`npm token create --packages-and-scopes-permission`). Providers that don't support permission-scoped tokens may ignore this and return a token valid for both. |
+| `accountHint` | string | no | Which account to use when multiple are available for the same registry. See below. |
+| `interactive` | boolean | yes | `true` by default; `false` only when user passes `--no-interactive`. See below. |
+| `retry` | boolean | yes | `true` on retry after registry auth failure (401/403). Provider should bypass its cache and re-acquire. |
+| `logLevel` | string | yes | Current npm log verbosity (from `--loglevel` or npm config). Providers may use to control diagnostic output. |
+| `network` | object | no | Proxy and TLS settings from npm config. See below. |
 
-- `v`: Integer protocol version. npm declares in every request — no
-  handshake. A **major** version bump signals breaking changes; if the
-  provider doesn't support the declared version, it must error with
-  `retryable: false`. npm fails with actionable guidance (e.g. "update the
-  provider or downgrade npm") and never retries with a lower version.
-  Backward-compatible additions (new optional fields) don't require a bump.
-  The provider does not echo the version back.
-- `registry`: Fully qualified absolute base URI. Resolved from the
-  nerf-darted config key where the provider was found. Always required.
-- `interactive`: Boolean. CI environments set `false`.
-- `forceRefresh`: npm sets `true` only on retry after auth failure.
+**accountHint resolution:** Sourced exclusively from the config key
+`credentialProviderAccountHint` in user/global `.npmrc`
+(e.g. `//<registryHost>:credentialProviderAccountHint=user@corp.com`).
+This is a new optional, explicit config entry that users/admins add manually;
+npm does not create it automatically and does not accept `--accountHint` CLI flags.
+If the config key is absent, the field is omitted.
+npm never writes `accountHint` to `.npmrc` — the config key is
+user-managed only. Providers may ignore the hint.
+
+**interactive semantics and `--no-interactive`:**
+
+- npm defaults `interactive` to `true` on all commands.
+- `--no-interactive` flag explicitly sets it to `false`. Available on any
+  command that may invoke a provider (`install`, `publish`, `view`,
+  `login`, etc.).
+- **Why default `true`:** Eliminates the manual login-then-retry workflow.
+  When a token expires mid-`npm install`, the provider can re-authenticate
+  (device code, MFA, broker prompt) without forcing the user to abort, run
+  `npm login`, and restart. Cargo's model — where expired tokens require a
+  manual `cargo login` — is the UX gap we are closing.
+- **Why not infer from TTY/CI:** TTY detection is unreliable (piped
+  terminals, Docker, SSH, IDE terminals produce false negatives). CI env
+  var sniffing adds heuristic complexity with no clear standard. The user
+  knows their context — `--no-interactive` is the explicit opt-out.
+- **CI guidance:** CI pipelines should pass the new `--no-interactive` flag
+  (or its env var equivalent `npm_config_no_interactive=true`, per npm's
+  standard config-to-env mapping). This is consistent with npm's existing
+  CI guidance — use `npm ci` instead of `npm install`, etc. — where CI
+  environments are expected to opt in to stricter, non-interactive behavior
+  explicitly.
+- **When `true`:** Provider may block for user interaction (browsers,
+  device codes, MFA). Must not read from `stdin` — it belongs to the
+  protocol stream.
+- **When `false`:** Provider must not block waiting for user interaction.
+  If it cannot acquire credentials silently, it must return an error.
+
+**network fields:** `httpsProxy`, `httpProxy`, `noProxy`, `strictSsl`,
+`caFile`. Absent fields mean "not configured." Forwarded because providers
+make their own outbound HTTP requests (e.g. to an identity provider) and
+cannot inherit these settings from the environment — npm's `cafile` and
+`strict-ssl` are npm-specific config, not Node.js TLS defaults, and proxy
+settings may differ from environment variables.
 
 Providers must ignore unknown fields for forward compatibility.
 
-#### Successful response
+npm expects providers to support the protocol version npm declares (`v`).
+If a provider does not support the declared version, it must respond with an
+`Err` of kind `"operation-not-supported"` with an appropriate message. npm will
+fail with actionable guidance and must not retry with a lower version.
 
-The response contains a top-level `account` field and a `credentials` object
-with an explicit `type` discriminator:
+#### `get` success response
 
 ```json
 {
-  "account": "user@example.com",
-  "credentials": {
-    "type": "bearer",
-    "token": "<token>"
+  "Ok": {
+    "kind": "get",
+    "auth": {
+      "type": "bearer",
+      "token": "<token>"
+    }
   }
 }
 ```
 
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `Ok.kind` | string | yes | Must be `"get"`. |
+| `Ok.auth` | object | yes | Credentials. See Auth Types below. |
+
+The `auth` object uses an explicit `type` discriminator field:
+
+**Bearer token** — npm sends `Authorization: Bearer <token>`:
 ```json
 {
-  "account": "user@example.com",
-  "credentials": {
-    "type": "basic",
-    "username": "<username>",
-    "password": "<password>"
+  "type": "bearer",
+  "token": "xxxxxxxxxxxx"
+}
+```
+
+**Basic auth** — npm encodes `username:password` to base64 and sends
+`Authorization: Basic <base64>`:
+```json
+{
+  "type": "basic",
+  "username": "someusername",
+  "password": "xxxxxxxxxxxx"
+}
+```
+
+Provider returns plain values; npm handles encoding.
+
+#### `login` request
+
+When a credential provider is configured for a registry, `npm login`
+delegates to the provider rather than performing its default behavior
+(persisting tokens in `.npmrc`).
+
+```json
+{
+  "v": 1,
+  "kind": "login",
+  "registry": "https://registry.example.com/",
+  "accountHint": "user@example.com",
+  "interactive": true,
+  "logLevel": "info",
+  "network": {
+    "httpsProxy": "https://proxy.example.com:8080",
+    "strictSsl": true
   }
 }
 ```
 
-| `credentials.type` | Required fields | HTTP header applied |
-|--------------------|-----------------|---------------------|
-| `"bearer"` | `token` | `Authorization: Bearer <token>` |
-| `"basic"` | `username`, `password` | `Authorization: Basic base64(username:password)` |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `v` | integer | yes | Protocol version. |
+| `kind` | string | yes | Must be `"login"`. |
+| `registry` | string | yes | Target registry base URI. |
+| `accountHint` | string | no | From `.npmrc` config (`credentialProviderAccountHint`). |
+| `interactive` | boolean | yes | `true` by default; `false` with `--no-interactive`. |
+| `logLevel` | string | yes | Current npm log verbosity. |
+| `network` | object | no | Proxy and TLS settings (same shape as `get`). Needed for outbound requests to identity providers. |
 
-Validation:
-- Missing or unrecognized `credentials.type` = protocol error.
-- Missing required fields for the declared type = protocol error.
-- npm ignores unknown fields within `credentials` (forward compatibility).
-- Providers should prefer bearer unless the registry requires basic.
+`login` reuses the `get` request context with two intentional differences:
+`retry` is always `true` (to force fresh authentication), and `permission` is
+omitted (login establishes identity/session state; any persisted permission
+scope is provider-defined). The provider executes the authentication flow
+(OAuth, device code, SSO, MFA, or equivalent) and persists resulting
+credentials in provider-managed secure storage (for example, OS keychain,
+encrypted file, or broker cache). npm does not receive or persist credential
+material during `login`; this operation is provider-managed end to end.
+
+`login` receives the same context fields as `get` (`network`, `logLevel`,
+`interactive`) because the provider makes the same outbound HTTP requests to
+identity providers. `--no-interactive` on `npm login` passes
+`interactive: false` — the provider should fail if it cannot authenticate
+silently (e.g. no cached refresh token available).
+
+Response on success:
+
+```json
+{
+  "Ok": {
+    "kind": "login"
+  }
+}
+```
+
+npm does not persist anything on login success — the provider owns
+credential storage entirely. If the user wants `accountHint` passed on
+subsequent commands, they configure it manually in `.npmrc`.
+
+This matches Cargo's `login` request kind where `npm login --registry <url>`
+delegates entirely to the provider, enabling modern auth flows (OAuth, SSO,
+device code) that `npm login` cannot handle natively.
+
+#### `logout` request
+
+When a credential provider is configured for a registry, `npm logout`
+delegates to the provider rather than removing `.npmrc` token entries.
+
+```json
+{
+  "v": 1,
+  "kind": "logout",
+  "registry": "https://registry.example.com/",
+  "logLevel": "info",
+  "network": {
+    "httpsProxy": "https://proxy.example.com:8080",
+    "strictSsl": true
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `v` | integer | yes | Protocol version. |
+| `kind` | string | yes | Must be `"logout"`. |
+| `registry` | string | yes | Target registry base URI. |
+| `logLevel` | string | yes | Current npm log verbosity. |
+| `network` | object | no | Proxy and TLS settings (same shape as `get`). Optional; omitted if no proxy/TLS config is set. May be used for best-effort server-side token revocation. |
+
+The provider removes stored credentials for that registry from its secure
+storage. Providers may optionally attempt server-side token revocation (e.g. `POST /oauth/revoke`)
+using the `network` context, but must not block logout on network failure — the user's intent
+is to remove local credentials, and that must always succeed.
+
+Response on success:
+
+```json
+{
+  "Ok": {
+    "kind": "logout"
+  }
+}
+```
+
+#### Behavior changes for `login` and `logout`
+
+- `npm login` must not persist tokens to `.npmrc` when a provider is
+  configured and returns `Ok`. The provider owns credential storage.
+- `npm logout` must not remove `.npmrc` token entries when a provider is
+  configured and returns `Ok`. It delegates to the provider.
+- If no provider is configured, `npm login` and `npm logout` behave as today
+  with no warning.
+- If a provider is configured but returns `operation-not-supported` for the
+  request kind, `npm login` and `npm logout` fall back to default behavior and
+  must emit an explicit warning that the operation downgraded from credential
+  provider mode.
+- If a provider is configured and fails during `login` (error kind `"other"`,
+  timeout, or non-zero exit), `npm login` must hard-fail — no fallback.
+  Falling back would persist a plaintext token to `.npmrc`, which is the exact
+  security regression this RFC exists to prevent.
+- If a provider is configured and fails during `logout` (error kind `"other"`,
+  timeout, or non-zero exit), `npm logout` falls back to removing the
+  `.npmrc` token entry and must emit an explicit warning. Logout failure
+  does not create a security hole — the fallback ensures local credentials
+  are still cleared.
 
 #### Error response
 
-On failure, the provider exits non-zero. If valid JSON is on `stdout`, npm
-reads two fields — the entire error contract:
+On failure, the provider responds with an `Err` object:
 
 ```json
 {
-  "message": "Interactive login is required but interactive mode is disabled.",
-  "retryable": false
+  "Err": {
+    "kind": "operation-not-supported",
+    "message": "Protocol version 2 is not supported by this provider."
+  }
 }
 ```
 
-- `retryable` (boolean, required): `true` = transient (network timeout, cache
-  lock) — npm may re-invoke. `false` = terminal (wrong mode, insufficient
-  permissions) — no retry.
+| Error kind | Meaning | npm behavior |
+|------------|---------|--------------|
+| `"url-not-supported"` | Provider does not handle this registry. | Skip to next provider in the configured list. |
+| `"operation-not-supported"` | Provider does not support this request kind. | `get`/`logout`: fall back to legacy auth with warning. `login`: fall back with warning. |
+| `"other"` | Generic error. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
+
+Fields:
+- `kind` (string, required): Error category.
 - `message` (string, required): Human-readable, suitable for display. Must not
   contain tokens, passwords, or PII.
 
-npm must redact credential-shaped values before writing logs. Bounded output
-limits (64 KiB stdout, 256 KiB stderr) — exceeded = kill provider.
-
 #### Timeout and retry
 
-**Timeout:** Default 120s (configurable via `credentialProviderTimeoutMs`).
-On expiry, npm kills the provider and treats it as failure.
+**Per-request timeouts:**
+
+All request kinds use a uniform timeout across request kinds. The default is
+120 seconds; this accommodates interactive flows (device code, MFA) that may
+occur even during `get` requests. If a provider exceeds the timeout, npm kills
+the process and treats it as failure. Users can override the default with
+`credentialProviderTimeoutMs` in user/global `.npmrc` (per-registry or global).
 
 **Auth failure retry flow:**
 
-npm should not interpret HTTP status codes to decide whether retry is
-worthwhile — the provider owns the identity layer and can distinguish a
-permanent 403 from a transient Conditional Access step-up.
+When npm receives HTTP 401, 403, or a similar auth failure from a registry:
 
-On auth failure (401, 403, or similar):
+1. npm evicts the in-memory cached credential for that registry.
+2. npm spawns the provider with a new `get` request with `retry: true`.
+   The provider should invalidate its cached credentials and re-acquire.
+3. If the provider returns new credentials, npm retries the failed registry
+   request.
+4. If the registry rejects again, npm fails the command — no further retries.
 
-1. npm re-invokes the provider with `forceRefresh: true`.
-2. The provider either returns new credentials (e.g. after step-up auth) or
-   a terminal error with `retryable: false`.
-3. npm replays the registry request with new credentials.
-4. If rejected again, npm fails without further retries.
-
-This gives providers full control over token refresh, CA step-up (MFA,
-device compliance), claims challenges, and account disambiguation.
+Retrying on both 401 and 403 improves on NuGet's credential provider
+protocol, which only retries on 401 and misses Conditional Access step-up
+scenarios that surface as 403.
 
 **Retry limits:**
-- Max 1 re-invocation per auth failure.
-- Max 3 total invocations per registry per npm command (initial + up to 2
-  retries).
+- Max 1 retry per auth failure per registry.
 
 ### Caching
 
 - The credential provider owns long-lived token cache and refresh policy.
 - npm must not implement long-lived caching — the CLI keeps a
   **process-lifetime in-memory cache** only.
-- A single `npm install` may trigger hundreds of registry requests across
-  sequential phases (dependency resolution, then tarball fetching). Without
-  process-lifetime caching, the provider would be spawned once per phase per
-  registry.
-- Cache key: provider id + registry base URI. If the protocol gains an
-  `operation` field (read vs. write tokens), the key must include it.
+- Cache key: provider id + registry base URI + permission.
 - npm must not persist tokens to disk.
-- `forceRefresh: true` evicts npm's in-memory cache and signals the provider
-  to bypass its own cache. It is never set on the first call of a session —
-  only on retry after an auth failure.
+- On auth failure, npm evicts the in-memory cache for that registry
+  and re-spawns the provider with `retry: true`, signaling it to bypass its
+  own cache.
 
-### Security Considerations
+### Example flows
 
-#### Provider Binary Integrity
+#### Desktop: login then use
 
-A credential provider is an arbitrary executable that npm spawns and hands
-registry context to. If an attacker can substitute that binary, they gain
-arbitrary code execution in the user's security context.
+Setup (once):
+```sh
+npm install -g @corp/credprovider  # install provider from public registry or local source
+```
 
-Security invariants:
+User `.npmrc` (`~/.npmrc`):
+```ini
+//registry.example.com:credentialProvider=@corp/credprovider
+```
 
-1. **Hash-at-registration, verify-at-every-spawn.** npm records SHA-256 at
-   registration and re-hashes on every spawn (including mid-restore
-   re-invocations). Mismatch = fail closed.
-2. **Registration is the trust boundary.** Installation alone does not grant
-   trust. Only explicit `npm credential-provider trust` authorizes spawning.
-   Project `.npmrc` can name a provider but cannot grant trust.
-3. **Absolute-path resolution, no PATH search.** npm spawns the registered
-   absolute path — never searches `$PATH`.
-4. **Restrictive file-system permissions.** Provider files writable only by
-   installing user/admin. npm verifies at registration and warns/fails if
-   too permissive.
+Project `.npmrc` (checked in with the repo):
+```ini
+registry=https://registry.example.com/
+```
+
+```sh
+# optional
+$ npm login --registry https://registry.example.com
+# Provider spawned with login request — opens full auth flow (browser, device code, SSO)
+# Provider stores credentials in OS keychain; npm persists nothing to .npmrc
+
+$ npm publish
+# npm resolves registry from project .npmrc; credential provider resolved from user .npmrc
+# Provider spawned with get request — returns cached token instantly from keychain. If token is not cached or needs to be refreshed, provider spawned again with login request — opens full auth flow (browser, device code, SSO)
+```
+
+#### CI: managed identity / workload identity
+
+Pipeline setup (once, in image or bootstrap step):
+```sh
+npm install -g @corp/credprovider
+```
+
+Pipeline `.npmrc`:
+```ini
+//registry.example.com:credentialProvider=@corp/credprovider
+```
+
+Pipeline run:
+```sh
+# Optional: some providers may require an explicit login step (e.g. service principal
+# registration). Providers using ambient identity (managed identity, workload
+# identity federation) could skip this.
+$ npm login --registry https://registry.example.com --no-interactive
+
+$ npm ci --no-interactive
+# Provider acquires token silently via ambient or pre-authenticated identity
+# Token used in-memory — nothing written to disk
+# If silent acquisition fails, npm hard-fails with a diagnostic
+```
+
+## Security Considerations
 
 #### Threat model
 
 | Threat | Attack vector | Defense |
 |--------|--------------|---------|
-| Binary substitution at rest | Malware, compromised install script, shared workstation | Hash check (1) + permissions (4) |
-| Mid-restore TOCTOU | Binary replaced between spawns | Hash check on every spawn (1) |
-| Malicious lifecycle scripts | `postinstall` overwrites provider | Permissions (4) + hash (1) + `ignore-scripts` |
-| PATH poisoning | Malicious `.env`, shell profile, CI manipulation | Absolute-path resolution (3) |
-| Typosquatting | Similarly-named package on public registry | Registration boundary (2) |
-| Malicious project `.npmrc` | Repo plants rogue provider config | Project config can name but not grant trust (2) |
+| Binary substitution at rest | Malware, compromised install script, shared workstation | Global prefix resolution + OS file permissions |
+| Malicious lifecycle scripts | `postinstall` overwrites provider | OS file permissions + opt-in install scripts |
+| PATH poisoning | Malicious `.env`, shell profile, CI manipulation | Global prefix resolution (no `$PATH` search) |
+| Typosquatting | Similarly-named package on public registry | User/global `.npmrc` is the trust boundary |
+| Malicious project `.npmrc` | Repo plants rogue provider config | Project `.npmrc` `credentialProvider` ignored |
+| Credential exfiltration via lifecycle scripts | `postinstall` spawns provider binary or `npm`/`npx` to acquire token | Opt-in install scripts |
 
-#### Token Exposure
+#### Process memory
 
-Required mitigations:
-- Tokens never passed on command lines, persisted in `.npmrc`, or re-exported
-  via environment variables.
-- npm must not expose credentials to lifecycle scripts, `npm exec`, or child
-  processes.
-- npm must redact Authorization headers, tokens, and passwords from logs,
-  error objects, and diagnostic reports.
-
-#### Redirect Handling
-
-- Strip `Authorization` on all cross-origin redirects (scheme, host, or port
-  change).
-- Same-origin redirects may preserve credentials only within the same
-  registry boundary.
-- Redirect to a different configured registry = new auth context = re-acquire
-  credentials for that target.
+Node.js (and any user-space process) holds secrets in plaintext memory while
+running. An attacker with sufficient access to read process memory (debugger
+attach, `/proc/<pid>/mem`, memory dump) can extract tokens regardless of how
+they were acquired. This RFC does not attempt to defend against that vector —
+it is an OS-level concern shared by every credential-bearing process. The
+goal is to eliminate **persistent** plaintext storage (`.npmrc` files,
+environment variables, shell history) that survives beyond the lifetime of a
+single command.
 
 ## Prior Art
 
@@ -468,44 +679,71 @@ Required mitigations:
   strings without integrity verification.
 - **NuGet credential providers** — .NET ecosystem uses a plugin protocol for
   credential acquisition with structured JSON communication over stdio.
+  One-shot model with version declared per-request.
 - **pip keyring** — Python's pip delegates credential storage/retrieval to the
   system keyring via a plugin interface.
 - **Git credential helpers** — Git invokes configured helpers via stdio to
-  acquire credentials for remote operations.
+  acquire credentials for remote operations. Actions (get, store, erase)
+  passed as CLI arguments. One-shot spawn model.
 - **Cargo credential providers** — Rust's Cargo uses a stdin/stdout JSON
-  protocol for credential provider plugins, which this design closely follows.
+  protocol for credential provider plugins. Long-lived process, version
+  hello on startup, multiple request kinds (get, login, logout). This design
+  adapts Cargo's message shapes and request kinds to a one-shot spawn model.
 
 ## Unresolved Questions and Bikeshedding
 
-- **`npm credential-provider trust` subcommand:** Does not exist yet. Required
-  before this feature can ship. Must compute SHA-256, display for confirmation,
-  and record in user config. UX details TBD (interactive confirmation prompt,
-  `--yes` flag for CI, output format).
-- **Lockfile-derived trust (future enhancement):** Can `package-lock.json`
-  SRI eventually supplement explicit registration for project-level providers?
+- **Enterprise-managed path installs:** This RFC requires provider package
+  names resolved from npm-managed global install locations and does not allow
+  absolute executable paths. Is global install from local package sources
+  sufficient for enterprise deployment needs, or should we add a future mode
+  for enterprise-managed absolute-path providers? If so, what trust and
+  integrity constraints would be required to avoid binary substitution risk?
+- **Lockfile-derived trust for project-local providers:** Can we safely enable
+  project/workspace-level credential provider configuration if
+  `package-lock.json` SRI hashes enable project-local provider resolution
+  (from `node_modules`) without the global install requirement? This would
+  solve the security problem — the lockfile pins the provider's integrity
+  before install, so a malicious project `.npmrc` cannot point to an
+  arbitrary binary. However, it creates a chicken-and-egg problem: the
+  provider must already be installed to authenticate to the registry, but
+  installing the provider requires authenticating to the registry. Solving
+  this would require `.npmrc` to support a separate unauthenticated registry configurations for
+  credential provider installation — significant complexity for v1.
   Not recommended for v1.
-- **Provider-id vs. raw command:** Should raw command strings be supported as a
-  compatibility/migration path? If so, should they be marked legacy-only?
-- **`npm login`/`npm logout` behavior** when a provider is configured:
-  `npm login` currently persists tokens to `.npmrc` via
-  `config.setCredentialsByURI()`, conflicting with provider-owned lifecycle.
-  Options: disable when provider configured, or delegate to provider.
-- **Cache key dimensions:** If an `operation` field is added (read-only token
-  for install vs. read-write for publish), the cache key must include it.
-- **Operation/command in request:** Should providers know whether npm is
-  installing vs. publishing vs. `npx`? Enables scoped tokens but raises
-  questions about transitive invocations.
-- **Global kill-switch:** `--no-credential-provider` to disable all providers
-  and fall back to legacy auth. Should emit a warning since it re-enables
-  plaintext tokens.
+- **`authChallenges` and `httpStatus`:** this design does not
+  forward `WWW-Authenticate` header values or the HTTP status code to the
+  provider. On retry, providers receive only `retry: true` and must do their
+  best re-acquisition (silent refresh, broker call, etc.). If the new token
+  is still rejected, npm fails. This is sufficient for the common case
+  (expired tokens). Richer challenge forwarding and status codes can be added.
 
 ## Acknowledgments
 
-This RFC builds on protocol design work by
-[@Filyus](https://github.com/Filyus)
-([unofficial-npm-credential-provider-rfc](https://github.com/Filyus/unofficial-npm-credential-provider-rfc)),
-particularly the bidirectional JSON protocol design, structured error kinds,
-version negotiation concepts, and provider chaining model. Key ideas from that
-draft — including per-scope/per-package granularity, explicit `refresh` and
-`erase` request kinds, batch mode, and the security threat model around
-project-local resolution — informed the design choices in this RFC.
+This RFC builds on the original credential provider RFC contribution by
+[@pwoosam](https://github.com/pwoosam)
+([npm/rfcs#850](https://github.com/npm/rfcs/pull/850)), which established the
+core concept of a stdio-based credential provider plugin for npm, including
+provider discovery via `.npmrc`, the one-shot spawn model, structured JSON
+request/response protocol, and a security-focused auth posture. That PR
+serves as the foundation for this work.
+
+The protocol design in this RFC draws extensively from the
+[unofficial-npm-credential-provider-rfc](https://github.com/Filyus/unofficial-npm-credential-provider-rfc)
+draft, which proposed a bidirectional JSON protocol with version negotiation,
+structured error kinds (`url-not-supported`, `not-found`,
+`operation-not-supported`, `other`), explicit request kinds (get, login,
+logout, refresh, erase, get-batch), cache control fields
+(`cache`, `expiresAt`, `operationIndependent`, `granularity`), the `erase`
+request for credential rejection notification, retry context (`retry`,
+`httpStatus`, `authChallenges`), the `interactive` field for CI/non-interactive
+behavior, provider chaining via `url-not-supported`, per-request timeouts by
+kind, and a comprehensive security threat model. The protocol shapes and
+error taxonomy in this RFC are directly adapted from that draft.
+
+
+Additional design influence from
+[Cargo's credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html),
+which established the pattern of structured JSON messages on stdin/stdout,
+stderr for diagnostics, and request kinds (get, login, logout) for credential
+provider plugins.
+
