@@ -133,7 +133,8 @@ If provider resolution or execution fails, npm may fall back to legacy auth sour
    - Requires message framing (length-prefix or newline-delimited JSON) — one-shot uses EOF as the natural delimiter.
    - Each request is an isolated process — no corrupted state carries over from a previous failure.
    - Provider implementation reduces to: read stdin, write stdout, exit.
-   - Git credential helpers and NuGet credential providers both use one-shot successfully at massive scale.
+   - Git credential helpers use one-shot successfully at massive scale.
+   - NuGet's credential provider is a long-lived bidirectional process; one-shot is simpler for v1 and version negotiation can be revisited if needed.
 
 The plugin protocol is the most secure and flexible option, aligning with prior art (pnpm tokenHelpers, NuGet credential providers, pip keyring, Git credential helpers, Cargo credential providers).
 
@@ -167,10 +168,6 @@ If all providers return `"url-not-supported"`:
 npm does not cache which provider succeeded for a given registry; providers are tried in order on every npm command.
 This matches Cargo's credential provider model.
 Provider-side token caching ensures the successful provider returns near-instantly on subsequent invocations, so the cost of re-trying the list is negligible in practice.
-
-> **Design note:** NuGet takes a different approach — it caches a per-registry mapping of which provider last succeeded, so subsequent commands skip straight to the winning provider.
-> This avoids re-trying the list but adds host-side state management.
-> The Cargo model is simpler and avoids staleness issues when provider configurations change.
 
 Example:
 
@@ -594,7 +591,7 @@ The goal is to eliminate **persistent** plaintext storage (`.npmrc` files, envir
 - **pnpm tokenHelpers** — pnpm supports `tokenHelpers` in `.npmrc` that invoke external commands to retrieve tokens.
   Similar concept but uses raw command strings without integrity verification.
 - **NuGet credential providers** — .NET ecosystem uses a plugin protocol for credential acquisition with structured JSON communication over stdio.
-  One-shot model with version declared per-request.
+  Long-lived bidirectional process with version negotiation on startup.
 - **pip keyring** — Python's pip delegates credential storage/retrieval to the system keyring via a plugin interface.
 - **Git credential helpers** — Git invokes configured helpers via stdio to acquire credentials for remote operations.
   Actions (get, store, erase) passed as CLI arguments.
