@@ -493,7 +493,8 @@ When npm receives HTTP 401, 403, or a similar auth failure from a registry:
 3. If the provider returns new credentials, npm retries the failed registry request.
 4. If the registry rejects again, npm fails the command — no further retries.
 
-Retrying on both 401 and 403 improves on NuGet's credential provider protocol, which only retries on 401 and misses Conditional Access step-up scenarios that surface as 403.
+Retrying on both 401 and 403 improves on NuGet's credential provider protocol, which only retries on 401.
+A 403 can indicate the token is valid but lacks required claims (e.g. MFA, device compliance) that a re-authentication could satisfy.
 
 **Retry limits:**
 - Max 1 retry per auth failure per registry.
