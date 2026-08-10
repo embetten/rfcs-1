@@ -9,6 +9,7 @@
 - [Detailed Explanation](#detailed-explanation)
   - [How it works (high level)](#how-it-works-high-level)
   - [Key components](#key-components)
+  - [Trusted publishing and `npm trust`](#trusted-publishing-and-npm-trust)
 - [Rationale and Alternatives](#rationale-and-alternatives)
 - [Implementation](#implementation)
   - [Plugin Discovery](#plugin-discovery)
@@ -48,6 +49,7 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 - Support short-lived tokens without manual rotation.
 - Support scoped registries and multiple registry configurations.
 - Support third-party registry authentication using npm CLI and third-party credential providers.
+- Preserve npm trusted publishing as the preferred authentication path for supported publish operations.
 - Preserve graceful fallback behavior if no provider is available.
 
 ### Non-Goals
@@ -108,6 +110,26 @@ If provider resolution or execution fails, npm may fall back to legacy auth sour
 - Ignore unknown request fields (forward compatibility).
 - Return credentials in a structured response shape.
 - Return structured errors when credential acquisition fails.
+
+### Trusted publishing and `npm trust`
+
+Credential providers and trusted publishers solve different authentication problems and are separate extension points.
+A trusted publisher authenticates a CI/CD workload for a specific package and publish operation by exchanging an OIDC identity token with the registry.
+A credential provider supplies conventional registry credentials for requests that require them, including package reads, token-based publishes, and registry-management commands.
+
+For `npm publish` and `npm stage publish`, npm must preserve its existing authentication precedence: when the target registry supports trusted publishing and a supported OIDC environment is available, npm attempts its built-in OIDC exchange before consulting configured credential providers or legacy credentials.
+Credential provider configuration must not disable, replace, or intercept this built-in trusted-publishing path.
+If npm's trusted-publishing implementation proceeds to its existing traditional-auth fallback, the configured credential provider is consulted before legacy credentials.
+OIDC identity tokens, claims, and exchange responses must never be sent to a credential provider.
+
+The `npm trust` command manages the registry-side relationship between a package and a trusted publisher; it does not perform a trusted publish.
+Its registry API calls therefore use the normal credential resolution path.
+When a credential provider is configured for the target registry, `npm trust list` invokes it with a `get` request and `permission: "read-only"`, while commands that create, update, or revoke trust invoke it with `permission: "read-write"`.
+No new `trust` protocol request kind is needed: the provider authenticates the registry request, and npm remains responsible for trust configuration, confirmation prompts, and any registry-required OTP or browser-based proof of presence.
+
+For example, an npm-maintained credential provider for `registry.npmjs.org` would be globally installed and selected with the same per-registry `credentialProvider` configuration as any other provider.
+Once configured, `npm trust` would automatically use credentials returned by that provider for its management API calls.
+Adding a new trusted-publisher type to commands such as `npm trust github` is separate from credential acquisition and requires support in the npm CLI and registry, or a future trusted-publisher discovery protocol; installing a credential provider alone must not register new `npm trust` subcommands or teach the registry to validate a new OIDC issuer.
 
 ## Rationale and Alternatives
 
