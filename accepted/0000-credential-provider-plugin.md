@@ -59,7 +59,7 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 - Persist returned tokens to disk (explicitly avoided).
 - Reintroduce a pre/post-install script vector or enable execution of untrusted arbitrary binaries.
   This protocol is a narrowly scoped, user-controlled auth hook — not a general-purpose plugin system.
-
+- Trusted publisher behavior change or feature replacement.
 
 ## Detailed Explanation
 
@@ -127,7 +127,7 @@ Its registry API calls therefore use the normal credential resolution path.
 When a credential provider is configured for the target registry, `npm trust list` invokes it with a `get` request and `permission: "read-only"`, while commands that create, update, or revoke trust invoke it with `permission: "read-write"`.
 No new `trust` protocol request kind is needed: the provider authenticates the registry request, and npm remains responsible for trust configuration, confirmation prompts, and any registry-required OTP or browser-based proof of presence.
 
-For example, an npm-maintained credential provider for `registry.npmjs.org` would be globally installed and selected with the same per-registry `credentialProvider` configuration as any other provider.
+For example, an npm-maintained credential provider for `registry.npmjs.org` would be installed as an executable and selected with the same per-registry `credentialProvider` configuration as any other provider.
 Once configured, `npm trust` would automatically use credentials returned by that provider for its management API calls.
 Adding a new trusted-publisher type to commands such as `npm trust github` is separate from credential acquisition and requires support in the npm CLI and registry, or a future trusted-publisher discovery protocol; installing a credential provider alone must not register new `npm trust` subcommands or teach the registry to validate a new OIDC issuer.
 
@@ -139,13 +139,13 @@ Adding a new trusted-publisher type to commands such as `npm trust github` is se
    Adds key management and cross-platform complexity; does not solve rotation or dynamic retrieval.
 3. **Environment variables exclusively** — Rejected.
    Still violates secure storage policies; does not scale for short-lived tokens across dev machines and CI/CD.
-4. **Direct command registration** — Not recommended as primary model.
-   Providers configured as raw commands (e.g. `//<registryHost>:credentialProvider=<command>`).
+4. **Shell command registration** — Rejected.
+  Providers configured as shell command strings with arguments (e.g. `//<registryHost>:credentialProvider=<command> <arguments>`).
    Drawbacks:
-   - No integrity verification — npm trusts whatever the path resolves to.
-   - No versioning or update detection.
    - Shell injection risk if command string passes through shell parsing.
-   - No discoverability or ecosystem conventions.
+  - Platform-dependent quoting and escaping.
+  - Ambiguous separation between the executable and its arguments.
+  This does not preclude direct executable registration: this RFC accepts a path or executable name, passes no configured arguments, and never invokes a shell.
 5. **Long-lived bidirectional process** — Considered.
    Provider stays alive for the duration of the npm command; npm sends multiple requests on the same stdin/stdout stream.
    Amortizes startup cost and enables richer protocol features (refresh, batch).
@@ -166,13 +166,13 @@ The plugin protocol is the most secure and flexible option, aligning with prior 
 
 #### Configuration
 
-The user or global `.npmrc` stores provider identifiers, not shell commands.
-The value is an ordered, comma-separated list of provider ids:
+The user or global `.npmrc` stores executable references, not npm package identifiers or shell commands.
+The value is an ordered, comma-separated list of absolute executable paths or bare executable names:
 
-- `//<registryHost>:credentialProvider=<id>[,<id>...]` (per-registry)
+- `//<registryHost>:credentialProvider=<executable>[,<executable>...]` (per-registry)
 
 Only per-registry configuration is supported.
-Global default (`credentialProvider=<id>`) and per-scope (`@scope:credentialProvider=<id>`) forms are intentionally omitted.
+Global default (`credentialProvider=<executable>`) and per-scope (`@scope:credentialProvider=<executable>`) forms are intentionally omitted.
 Rationale: the effective registry URL comes from project `.npmrc` (which may be checked into a repo).
 A global or scope-level provider is not bound to any specific host, so a malicious project `.npmrc` setting `registry=https://evil.example/` would cause the provider to mint a token and npm to send it to an attacker-controlled host.
 Per-registry configuration binds the provider to a specific trusted host, eliminating this exfiltration vector by construction.
@@ -196,20 +196,30 @@ Example:
 ```ini
 # ~/.npmrc
 
-# Per-host — provider is bound to this specific host
-//registry.example.com:credentialProvider=@corp/credprovider
+# Per-host — bare name is resolved from PATH
+//registry.example.com:credentialProvider=corp-npm-credprovider
 //registry.example.com:credentialProviderAccountHint=user@corp.com
 
-# per registry — each with its own provider config
-//pkgs.dev.azure.com/org/_packaging/feed/npm/registry:credentialProvider=@corp/credprovider,@backup/credprovider
+# Per registry — absolute paths and fallback providers are supported
+//pkgs.dev.azure.com/org/_packaging/feed/npm/registry:credentialProvider=C:\Program Files\Contoso\npm-credprovider.exe,D:\Tools\backup-credprovider.exe
 ```
 
 #### Provider Binary Resolution
 
-The provider reference in user/global `.npmrc` must be a provider package name resolved from npm-managed global install locations.
-npm must never resolve providers from `$PATH` or project `node_modules`.
-Adding the provider to user/global `.npmrc` **is** the trust decision — the same model as Git and Docker credential helpers.
-The provider must be installable from a trusted source that does not itself require the provider (public registry, local package source with global install, or enterprise bootstrap script).
+Each provider reference in user/global `.npmrc` must be either an absolute path to an executable or a bare executable name containing no directory separators.
+Relative paths are rejected because resolving them against the current working directory would allow a project to substitute a provider binary.
+Shell command strings, configured arguments, environment-variable expansion, and home-directory expansion are not supported.
+
+For an absolute path, npm validates that the target exists and is executable, then spawns that path directly.
+For a bare executable name, npm resolves it using the npm process's `PATH` and the platform's normal executable-extension rules.
+npm must ignore empty and relative `PATH` entries during this search so resolution can never fall back to the project working directory.
+After resolving a bare name, npm spawns the resulting absolute path directly without a shell.
+If resolution fails or produces a non-executable file, that provider invocation fails under the normal provider fallback rules.
+
+Adding an executable reference to user/global `.npmrc` **is** the trust decision — the same model as Git and Docker credential helpers.
+npm does not install, update, or verify the provenance of provider binaries.
+Administrators are responsible for deploying providers and protecting the executable and its containing directory from modification by less-trusted users.
+Absolute paths are recommended for CI and other high-assurance environments because they avoid dependence on mutable `PATH` ordering.
 
 ### Protocol
 
@@ -522,7 +532,7 @@ A 403 can indicate the token is valid but lacks required claims (e.g. MFA, devic
 
 - The credential provider owns long-lived token cache and refresh policy.
 - npm must not implement long-lived caching — the CLI keeps a **process-lifetime in-memory cache** only.
-- Cache key: provider id + registry base URI + permission.
+- Cache key: resolved provider executable path + registry base URI + permission.
 - npm must not persist tokens to disk.
 - On auth failure (401/403), npm evicts **all** permission variants of the in-memory cache for that registry (both read-only and read-write entries) and re-spawns the provider with `retry: true`, signaling it to bypass its own cache.
   This avoids stale entries when a read-write rejection also invalidates the read-only token (worst case is one redundant spawn).
@@ -533,12 +543,12 @@ A 403 can indicate the token is valid but lacks required claims (e.g. MFA, devic
 
 Setup (once):
 ```sh
-npm install -g @corp/credprovider  # install provider from public registry or local source
+# Install corp-npm-credprovider using the vendor's installer or enterprise software deployment.
 ```
 
 User `.npmrc` (`~/.npmrc`):
 ```ini
-//registry.example.com:credentialProvider=@corp/credprovider
+//registry.example.com:credentialProvider=corp-npm-credprovider
 ```
 
 Project `.npmrc` (checked in with the repo):
@@ -563,12 +573,12 @@ $ npm publish
 
 Pipeline setup (once, in image or bootstrap step):
 ```sh
-npm install -g @corp/credprovider
+# Install /opt/corp/bin/corp-npm-credprovider in the pipeline image.
 ```
 
 Pipeline `.npmrc`:
 ```ini
-//registry.example.com:credentialProvider=@corp/credprovider
+//registry.example.com:credentialProvider=/opt/corp/bin/corp-npm-credprovider
 ```
 
 Pipeline run:
@@ -586,18 +596,23 @@ $ npm ci --no-interactive
 
 ## Security Considerations
 
+#### Trust boundary
+
+Credential providers protect credentials at rest and support short-lived authentication.
+They do not sandbox package code or defend against arbitrary code already executing with the user's identity.
+Providers must avoid granting that code authority beyond what the user's current session already possesses.
+
 #### Threat model
 
 | Threat | Attack vector | Defense |
 |--------|--------------|---------|
-| Binary substitution at rest | Malware, compromised install script, shared workstation | Global prefix resolution + OS file permissions |
-| Malicious lifecycle scripts | `postinstall` overwrites provider | OS file permissions + opt-in install scripts (default in npm 12+) |
-| PATH poisoning | Malicious `.env`, shell profile, CI manipulation | Global prefix resolution (no `$PATH` search) |
-| Typosquatting | Similarly-named package on public registry | User/global `.npmrc` is the trust boundary |
+| Binary substitution at rest | Malware, compromised installer, shared workstation | User/global `.npmrc` trust decision + OS permissions on the executable and containing directory |
+| PATH poisoning | Malicious shell profile, CI manipulation, relative or empty `PATH` entry | Prefer absolute paths; bare names search only absolute, non-empty `PATH` entries and are resolved to an absolute path before spawn |
+| Executable-name collision | A different binary with the same name appears earlier in `PATH` | Prefer absolute paths; log the resolved executable path at verbose log levels |
 | Malicious project `.npmrc` | Repo plants rogue provider config | All `credentialProvider*` keys ignored from project `.npmrc` |
 | Timeout manipulation via project `.npmrc` | `credentialProviderTimeoutMs=1` forces timeout to trigger fallback | `credentialProviderTimeoutMs` ignored from project `.npmrc` |
 | Account hint redirection | `credentialProviderAccountHint` redirects to attacker account | `credentialProviderAccountHint` ignored from project `.npmrc` |
-| Credential exfiltration via lifecycle scripts | `postinstall` spawns provider binary or `npm`/`npx` to acquire token | Opt-in install scripts (default in npm 12+) |
+| Provider replacement through project dependencies | User config points into project-controlled `node_modules` and an install changes the executable | Recommend deployment to an administrator-controlled directory; user/global configuration remains an explicit trust decision |
 | Token exfiltration via registry redirect | Project `.npmrc` sets `registry=https://evil.example/`; global provider mints a token and npm sends it to the attacker | Per-registry config only — no global/scope providers. Provider is bound to a specific trusted host by construction. Providers should additionally return `url-not-supported` for unrecognized hosts. |
 | Network interception via project `.npmrc` | Project `.npmrc` sets `https-proxy` or `cafile` to route provider IdP calls through attacker proxy | `network.*` fields sourced from user/global `.npmrc` only; project-level network settings never forwarded to providers |
 
@@ -624,14 +639,6 @@ The goal is to eliminate **persistent** plaintext storage (`.npmrc` files, envir
 
 ## Unresolved Questions and Bikeshedding
 
-- **Enterprise-managed path installs:** This RFC requires provider package names resolved from npm-managed global install locations and does not allow absolute executable paths.
-  Is global install from local package sources sufficient for enterprise deployment needs, or should we add a future mode for enterprise-managed absolute-path providers?
-  If so, what trust and integrity constraints would be required to avoid binary substitution risk?
-- **Lockfile-derived trust for project-local providers:** Can we safely enable project/workspace-level credential provider configuration if `package-lock.json` SRI hashes enable project-local provider resolution (from `node_modules`) without the global install requirement?
-  This would solve the security problem — the lockfile pins the provider's integrity before install, so a malicious project `.npmrc` cannot point to an arbitrary binary.
-  However, it creates a chicken-and-egg problem: the provider must already be installed to authenticate to the registry, but installing the provider requires authenticating to the registry.
-  Solving this would require `.npmrc` to support a separate unauthenticated registry configurations for credential provider installation — significant complexity for v1.
-  Not recommended for v1.
 - **`authChallenges` and `httpStatus`:** this design does not forward `WWW-Authenticate` header values or the HTTP status code to the provider.
   On retry, providers receive only `retry: true` and must do their best re-acquisition (silent refresh, broker call, etc.).
   If the new token is still rejected, npm fails.
