@@ -218,7 +218,9 @@ Provider installation source, executable path, version, and integrity are proper
 This managed-installation design is an alternative to the simpler direct-executable discovery model proposed on the primary RFC branch and may be more machinery than v1 requires.
 Its integrity records improve auditability and detect accidental or partial replacement, but a digest stored with a user-managed provider does not prevent malicious code running as that user from replacing both the provider and its integrity metadata.
 Only an administrator-owned store and policy can prevent that same-user replacement.
-Requiring a dedicated store, lockfile, installed-file manifest, and verification policy also sets a higher assurance bar than existing credential-provider protocols and npm's current executable trust model.
+This design adds package lifecycle, inventory, and tamper-detection controls beyond those required by Cargo credential providers, Git credential helpers, pnpm token helpers, and current NuGet plugin discovery.
+Those controls may be particularly valuable in npm because lifecycle scripts, `npm run`, `npm exec`, and executables from project `node_modules/.bin` are pervasive and normally run with the user's identity, making isolation from project and global executable resolution an important defense in depth.
+They increase complexity, however, and do not prevent same-user replacement unless backed by administrator-owned policy and storage.
 The additional complexity should therefore be justified primarily by package distribution, versioning, inventory, and enterprise policy needs rather than presented as a complete defense against same-user compromise.
 
 npm maintains credential providers in a dedicated data store that is independent of the current project, npm's disposable cache, npm's global prefix, and the active Node.js installation.
