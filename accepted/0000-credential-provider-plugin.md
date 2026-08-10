@@ -215,6 +215,12 @@ Provider installation source, executable path, version, and integrity are proper
 
 #### Provider records and stores
 
+This managed-installation design is an alternative to the simpler direct-executable discovery model proposed on the primary RFC branch and may be more machinery than v1 requires.
+Its integrity records improve auditability and detect accidental or partial replacement, but a digest stored with a user-managed provider does not prevent malicious code running as that user from replacing both the provider and its integrity metadata.
+Only an administrator-owned store and policy can prevent that same-user replacement.
+Requiring a dedicated store, lockfile, installed-file manifest, and verification policy also sets a higher assurance bar than existing credential-provider protocols and npm's current executable trust model.
+The additional complexity should therefore be justified primarily by package distribution, versioning, inventory, and enterprise policy needs rather than presented as a complete defense against same-user compromise.
+
 npm maintains credential providers in a dedicated data store that is independent of the current project, npm's disposable cache, npm's global prefix, and the active Node.js installation.
 Changing Node.js versions or npm's `prefix` must not change which provider an id resolves to.
 The store contains an index of enrolled provider records and immutable, versioned installation directories for npm-package providers.
