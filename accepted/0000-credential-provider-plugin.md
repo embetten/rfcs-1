@@ -139,14 +139,26 @@ Adding a new trusted-publisher type to commands such as `npm trust github` is se
    Adds key management and cross-platform complexity; does not solve rotation or dynamic retrieval.
 3. **Environment variables exclusively** — Rejected.
    Still violates secure storage policies; does not scale for short-lived tokens across dev machines and CI/CD.
-4. **Shell command registration** — Rejected.
+4. **Pipe an ephemeral user config through standard input** — Rejected.
+  On Unix-like systems, this works today:
+  ```sh
+  provide_npmrc | npm install --userconfig=/dev/stdin
+  ```
+  `@npmcli/config` treats `userconfig` as a file path and reads it once during npm startup, before command dispatch.
+  The resulting configuration is available to any top-level, non-interactive npm command, not only `install`.
+  The token is not placed in command-line arguments or an environment variable, and commands such as `install`, `audit`, and `publish` do not write the user config back to disk.
+  This is not a viable general solution because `/dev/stdin` has no portable cross-platform equivalent, interactive commands may need standard input for their own prompts, and nested npm invocations from lifecycle scripts cannot reliably reread the already-consumed config stream.
+  An `install` lifecycle script cannot invoke `npm install` to establish this configuration without recursively triggering itself.
+  Users would instead need to define a separately named script or wrapper that runs `provide_npmrc | npm install --userconfig=/dev/stdin`, then remember to use that alternate command instead of the ordinary npm command.
+  Requiring application-specific package configuration and a separate command merely to authenticate is an unacceptable user setup burden.
+5. **Shell command registration** — Rejected.
   Providers configured as shell command strings with arguments (e.g. `//<registryHost>:credentialProvider=<command> <arguments>`).
    Drawbacks:
    - Shell injection risk if command string passes through shell parsing.
   - Platform-dependent quoting and escaping.
   - Ambiguous separation between the executable and its arguments.
   This does not preclude direct executable registration: this RFC accepts a path or executable name, passes no configured arguments, and never invokes a shell.
-5. **Long-lived bidirectional process** — Considered.
+6. **Long-lived bidirectional process** — Considered.
    Provider stays alive for the duration of the npm command; npm sends multiple requests on the same stdin/stdout stream.
    Amortizes startup cost and enables richer protocol features (refresh, batch).
    Not recommended for v1:
@@ -639,6 +651,12 @@ The goal is to eliminate **persistent** plaintext storage (`.npmrc` files, envir
 
 ## Unresolved Questions and Bikeshedding
 
+- **Provider installation guidance:** Now that the design configures providers as executables rather than global npm packages, should npm document conventional installation locations, or only warn against mutable or project-controlled locations?
+  Any recommended locations would be guidance, not implicit discovery paths.
+  Candidate user-managed locations are `%LocalAppData%\npm\credential-providers\<id>\` on Windows, `~/.local/share/npm/credential-providers/<id>/` on Linux and other XDG systems, and `~/Library/Application Support/npm/credential-providers/<id>/` on macOS.
+  Candidate administrator-managed locations are `%ProgramFiles%\npm\credential-providers\<id>\` on Windows, an OS or package-manager `libexec` directory such as `/usr/local/libexec/npm/credential-providers/<id>/` on POSIX systems, and `/Library/Application Support/npm/credential-providers/<id>/` on macOS.
+  Regardless of the convention, each provider should have its own restrictively writable directory and user/global `.npmrc` should explicitly name its executable by absolute path.
+  Project `node_modules`, project `.bin`, npm's global package prefix, npm's cache, temporary directories, and the current working directory are poor candidates because they are mutable, disposable, or affected by project and Node.js version changes.
 - **`authChallenges` and `httpStatus`:** this design does not forward `WWW-Authenticate` header values or the HTTP status code to the provider.
   On retry, providers receive only `retry: true` and must do their best re-acquisition (silent refresh, broker call, etc.).
   If the new token is still rejected, npm fails.
