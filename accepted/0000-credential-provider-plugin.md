@@ -75,7 +75,7 @@ If provider resolution or execution fails, npm may fall back to legacy auth sour
 2. **Plugin discovery**: NPM finds and resolves the ordered list of credential providers configured for the target registry.
    This happens once per registry per command, regardless of how many workspace members need that registry.
 3. **Invoke provider**: NPM spawns the first provider as a child process, writes a JSON request to `stdin`, then closes the write end (sends EOF).
-   The provider writes a JSON response to `stdout`, then exits.
+  The provider writes a JSON response to `stdout`, then exits.
    If the provider returns an error with kind `"url-not-supported"`, npm tries the next provider in the list.
    npm serializes provider invocations to avoid overlapping prompts and ambiguous-account errors.
 4. **Use token in-memory**: NPM uses the returned token for the outgoing HTTP request without writing it to disk.
@@ -151,20 +151,28 @@ Adding a new trusted-publisher type to commands such as `npm trust github` is se
   An `install` lifecycle script cannot invoke `npm install` to establish this configuration without recursively triggering itself.
   Users would instead need to define a separately named script or wrapper that runs `provide_npmrc | npm install --userconfig=/dev/stdin`, then remember to use that alternate command instead of the ordinary npm command.
   Requiring application-specific package configuration and a separate command merely to authenticate is an unacceptable user setup burden.
-5. **Shell command registration** — Rejected.
+5. **Require providers as global npm packages** — Rejected.
+  Earlier versions of this proposal configured a global npm package name and resolved its executable from npm's global installation prefix.
+  [npm's documentation](https://docs.npmjs.com/downloading-and-installing-packages-globally/) recommends using `npx` to run packages globally rather than relying on global installation.
+  `npx` and `npm exec` are also inappropriate for an authentication hook because their resolution may involve project dependencies, npm's cache, or downloading a missing package at invocation time.
+  Global installations are coupled to the active npm prefix and are often changed or isolated by Node.js version, making provider availability depend on Node.js installation version.
+  Package-name and bin resolution also add ambiguity when packages expose multiple executables and require npm-specific package lookup for an authentication hook that ultimately only needs to spawn a process.
+  Configuring an absolute executable path or a bare executable name keeps runtime discovery independent of npm's package installation state, supports native installers and enterprise software deployment, and makes the exact executable visible in user/global `.npmrc`.
+  Providers may still be distributed as npm packages, but installing them as project dependencies or executing them from project `node_modules/.bin` is not advised because those locations are project-controlled.
+6. **Shell command registration** — Rejected.
   Providers configured as shell command strings with arguments (e.g. `//<registryHost>:credentialProvider=<command> <arguments>`).
    Drawbacks:
    - Shell injection risk if command string passes through shell parsing.
   - Platform-dependent quoting and escaping.
   - Ambiguous separation between the executable and its arguments.
   This does not preclude direct executable registration: this RFC accepts a path or executable name, passes no configured arguments, and never invokes a shell.
-6. **Long-lived bidirectional process** — Considered.
+7. **Long-lived bidirectional process** — Considered.
    Provider stays alive for the duration of the npm command; npm sends multiple requests on the same stdin/stdout stream.
    Amortizes startup cost and enables richer protocol features (refresh, batch).
    Not recommended for v1:
    - In-memory cache already limits spawns to 1-2 per registry per command.
    - Adds process lifecycle management (crash detection, reconnection, graceful shutdown) to both npm and every provider implementation.
-   - Requires message framing (length-prefix or newline-delimited JSON) — one-shot uses EOF as the natural delimiter.
+  - Requires message framing (length-prefix or newline-delimited JSON) — one-shot uses EOF as the natural delimiter.
    - Each request is an isolated process — no corrupted state carries over from a previous failure.
    - Provider implementation reduces to: read stdin, write stdout, exit.
    - Git credential helpers use one-shot successfully at massive scale.
@@ -240,14 +248,16 @@ Providers are executed as a child process using a `stdin`/`stdout` JSON protocol
 - npm spawns the provider executable with no command-line arguments and no shell interpolation.
 - npm writes exactly one UTF-8 JSON request to `stdin`, then closes the write end (sends EOF).
 - The provider writes exactly one UTF-8 JSON response to `stdout`, then exits.
-- `stderr` is reserved for diagnostic logging — npm streams it to the user per loglevel but never parses it.
+- `stdout` is reserved for the protocol response; interactive instructions and diagnostics use inherited `stderr`.
+  npm does not parse `stderr` or treat its output as provider failure.
 - Exit code 0 + recognized `Ok` response = success.
   Non-zero exit or `Err` response = failure.
 - npm enforces a uniform timeout (see [Timeout and retry](#timeout-and-retry)).
   On expiry, npm kills the process and treats it as failure.
   Configurable via `credentialProviderTimeoutMs` in user/global `.npmrc`.
 
-This follows [Cargo's credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html) — structured communication via `stdin`/`stdout`, `stderr` for diagnostics — adapted to a one-shot spawn model similar to NuGet credential providers and Git credential helpers.
+This follows [Cargo's credential provider protocol](https://doc.rust-lang.org/cargo/reference/credential-provider-protocol.html), where protocol messages use `stdin`/`stdout` and interactive output uses inherited `stderr`.
+It intentionally differs from NuGet's structured logging messages: npm gives up the ability to parse, filter, or format provider output in exchange for a simpler one-shot protocol and provider implementation.
 
 #### Request kinds
 
@@ -321,6 +331,7 @@ Providers may ignore the hint.
 - **CI guidance:** CI pipelines should pass the new `--no-interactive` flag (or its env var equivalent `npm_config_interactive=false`, per npm's standard config-to-env mapping).
   This is consistent with npm's existing CI guidance — use `npm ci` instead of `npm install`, etc. — where CI environments are expected to opt in to stricter, non-interactive behavior explicitly.
 - **When `true`:** Provider may block for user interaction (browsers, device codes, MFA).
+  A provider may write device-code or similar instructions to `stderr`; npm displays them while the provider remains running and waits for authentication to complete.
   Must not read from `stdin` — it belongs to the protocol stream.
 - **When `false`:** Provider must not block waiting for user interaction.
   If it cannot acquire credentials silently, it must return an error.
@@ -651,7 +662,10 @@ The goal is to eliminate **persistent** plaintext storage (`.npmrc` files, envir
 
 ## Unresolved Questions and Bikeshedding
 
-- **Provider installation guidance:** Now that the design configures providers as executables rather than global npm packages, should npm document conventional installation locations, or only warn against mutable or project-controlled locations?
+- **Provider distribution and installation:** Provider distribution, installation, updates, and removal are deferred beyond v1 and remain the provider owner's responsibility.
+  Global npm packages remain possible but are discouraged for the reasons in [Rationale and Alternatives](#rationale-and-alternatives); native installers, package managers, and enterprise deployment may be used instead.
+  A future RFC may define an npm-managed command for one-line provider installation and registration to mimic the one-line dotnet tool installation experience.
+- **Provider installation locations:** Should npm document conventional installation locations, or only warn against mutable or project-controlled locations?
   Any recommended locations would be guidance, not implicit discovery paths.
   Candidate user-managed locations are `%LocalAppData%\npm\credential-providers\<id>\` on Windows, `~/.local/share/npm/credential-providers/<id>/` on Linux and other XDG systems, and `~/Library/Application Support/npm/credential-providers/<id>/` on macOS.
   Candidate administrator-managed locations are `%ProgramFiles%\npm\credential-providers\<id>\` on Windows, an OS or package-manager `libexec` directory such as `/usr/local/libexec/npm/credential-providers/<id>/` on POSIX systems, and `/Library/Application Support/npm/credential-providers/<id>/` on macOS.
