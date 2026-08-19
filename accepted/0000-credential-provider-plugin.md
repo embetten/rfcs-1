@@ -50,7 +50,8 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 - Support scoped registries and multiple registry configurations.
 - Support third-party registry authentication using npm CLI and third-party credential providers.
 - Preserve npm trusted publishing as the preferred authentication path for supported publish operations.
-- Preserve graceful fallback behavior if no provider is available.
+- Invoke credential providers only when a registry proves that authentication is required.
+- Prefer configured credential providers over legacy credentials for the same registry.
 
 ### Non-Goals
 
@@ -64,27 +65,25 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 ## Detailed Explanation
 
 The proposed plugin protocol defines a standard interface for external credential providers that can be invoked by the NPM CLI during authentication workflows.
-When NPM needs credentials for a registry request (for example, installing from or publishing to a private registry), the CLI invokes a configured credential provider at runtime and receives a token in response.
+When a registry request receives an HTTP `401` or `403` authentication failure, the CLI invokes a configured credential provider at runtime and receives credentials in response.
 This design avoids persisting tokens in `.npmrc` or relying on environment variables as a long-term secret store.
-When a credential provider is configured for a registry, that provider becomes the authoritative auth source for that registry.
-If provider resolution or execution fails, npm may fall back to legacy auth sources, but it must emit an explicit warning that auth downgraded from credential provider mode.
+When configured for a registry, providers are authoritative; npm uses legacy credentials only if every provider reports that the URL is unsupported and fails on other provider errors.
 
 ### How it works (high level)
 
-1. **Registry request requires auth**: NPM determines that a request to a registry requires authentication (install, publish, and similar operations).
-2. **Plugin discovery**: NPM finds and resolves the ordered list of credential providers configured for the target registry.
+1. **Registry request requires auth**: npm receives HTTP `401` or `403` from a registry request.
+2. **Plugin discovery**: npm finds and resolves the ordered list of credential providers configured for the target registry.
    This happens once per registry per command, regardless of how many workspace members need that registry.
-3. **Invoke provider**: NPM spawns the first provider as a child process, writes a JSON request to `stdin`, then closes the write end (sends EOF).
+3. **Invoke provider**: npm spawns the first provider as a child process, writes a JSON request to `stdin`, then closes the write end (sends EOF).
   The provider writes a JSON response to `stdout`, then exits.
    If the provider returns an error with kind `"url-not-supported"`, npm tries the next provider in the list.
    npm serializes provider invocations to avoid overlapping prompts and ambiguous-account errors.
-4. **Use token in-memory**: NPM uses the returned token for the outgoing HTTP request without writing it to disk.
-5. **Provider-owned token lifecycle**: NPM keeps a process-lifetime in-memory cache of provider responses (see [Caching](#caching)).
+4. **Use credentials in-memory**: npm retries the request with the returned credentials without writing them to disk.
+5. **Provider-owned token lifecycle**: npm keeps a process-lifetime in-memory cache of provider responses (see [Caching](#caching)).
    The cache ensures the provider is typically spawned only once per registry per npm command.
    Token caching and refresh policy beyond the current process are owned by the provider.
-6. **Failure handling**: If no provider is configured, NPM continues with existing credential behavior.
-   If a provider is configured but fails during a `get` or `logout` request, NPM warns and falls back to legacy credential behavior.
-   If a provider fails during a `login` request, NPM hard-fails — falling back would persist a plaintext token to `.npmrc`.
+6. **Failure handling**: If every provider returns `"url-not-supported"`, npm retries using legacy credentials when available.
+  Any other provider failure fails the request.
 
 ### Key components
 
@@ -94,19 +93,20 @@ If provider resolution or execution fails, npm may fall back to legacy auth sour
 - Resolve the ordered provider list for the target registry.
 - Try providers in configured order; advance on `"url-not-supported"` errors.
 - Resolve and pass request context to the provider via `stdin` JSON.
-- Declare the protocol version (`v`) in every request — no negotiation handshake.
-- Serialize provider invocations (one at a time) — even in non-interactive mode — for deterministic fallback and clear account-ambiguity diagnostics.
+- Send supported protocol versions in preference order (`versions`) in every request and validate the provider's selected version (`Ok.v`) — no separate negotiation handshake.
+- Serialize provider invocations across registries to prevent overlapping prompts and ambiguous-account errors.
 - Use returned credentials in-memory only.
 - Enforce retry limits and timeout; kill the provider on expiry.
 - Never log credentials, tokens, or authorization headers.
-- When provider execution fails on `get` or `logout`, fall back to legacy auth with an explicit warning.
-  When provider execution fails on `login`, hard-fail — no fallback.
+- Coalesce concurrent challenges for the same registry and permission.
+- Fall back to legacy credentials on `get` only when every configured provider returns `"url-not-supported"`.
+- Hard-fail on any other `get` or `login` provider failure.
 
 #### Plugin (credential provider)
 
 - Acquire credentials for the target registry.
 - Own token caching and refresh policy.
-- Validate the declared protocol version (`v`) on every request — fail immediately if unsupported.
+- Select the first supported protocol version from the host's ordered `versions` array and echo it as `Ok.v` on success.
 - Ignore unknown request fields (forward compatibility).
 - Return credentials in a structured response shape.
 - Return structured errors when credential acquisition fails.
@@ -281,7 +281,7 @@ When a provider returns `operation-not-supported` for `logout`, npm falls back t
 
 ```json
 {
-  "v": 1,
+  "versions": [1],
   "kind": "get",
   "registry": "https://pkgs.dev.azure.com/org/_packaging/feed/npm/registry/",
   "permission": "read-only",
@@ -301,7 +301,7 @@ When a provider returns `operation-not-supported` for `logout`, npm falls back t
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `v` | integer | yes | Protocol version. npm declares in every request — no handshake. Major version bump = breaking changes; new optional fields don't require a bump. Provider does not echo the version back. |
+| `versions` | array of integers | yes | Protocol versions supported by npm, in descending preference order. The provider selects the first version it supports. A major version represents breaking changes; new optional fields do not require a bump. |
 | `kind` | string | yes | Must be `"get"`. |
 | `registry` | string | yes | Fully qualified absolute base URI. Resolved from the nerf-darted config key where the provider was found. |
 | `permission` | string | yes | `"read-only"` (install, view, search) or `"read-write"` (publish, unpublish). Follows npm's existing token permission vocabulary (`npm token create --packages-and-scopes-permission`). Providers that don't support permission-scoped tokens may ignore this and return a token valid for both. |
@@ -346,15 +346,17 @@ A checked-in project `.npmrc` could otherwise route the provider's IdP exchange 
 
 Providers must ignore unknown fields for forward compatibility.
 
-npm expects providers to support the protocol version npm declares (`v`).
-If a provider does not support the declared version, it must respond with an `Err` of kind `"version-not-supported"` with an appropriate message.
-npm will fail with actionable guidance and must not retry with a lower version.
+`versions` contains unique positive integers in preference order; the provider selects the first version it supports and echoes it as `Ok.v`.
+npm rejects any other selection.
+If no version matches, the provider returns `Err.kind: "version-not-supported"` with its supported versions in `Err.message`, and npm fails with update guidance.
+This negotiation envelope is stable across protocol versions.
 
 #### `get` success response
 
 ```json
 {
   "Ok": {
+    "v": 1,
     "kind": "get",
     "auth": {
       "type": "bearer",
@@ -366,6 +368,7 @@ npm will fail with actionable guidance and must not retry with a lower version.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `Ok.v` | integer | yes | Protocol version selected from the request's ordered `versions` array. |
 | `Ok.kind` | string | yes | Must be `"get"`. |
 | `Ok.auth` | object | yes | Credentials. See Auth Types below. |
 
@@ -396,7 +399,7 @@ When a credential provider is configured for a registry, `npm login` delegates t
 
 ```json
 {
-  "v": 1,
+  "versions": [1],
   "kind": "login",
   "registry": "https://registry.example.com/",
   "accountHint": "user@example.com",
@@ -412,7 +415,7 @@ When a credential provider is configured for a registry, `npm login` delegates t
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `v` | integer | yes | Protocol version. |
+| `versions` | array of integers | yes | Supported protocol versions in preference order; same negotiation rules as `get`. |
 | `kind` | string | yes | Must be `"login"`. |
 | `registry` | string | yes | Target registry base URI. |
 | `accountHint` | string | no | From `.npmrc` config (`credentialProviderAccountHint`). |
@@ -433,6 +436,7 @@ Response on success:
 ```json
 {
   "Ok": {
+    "v": 1,
     "kind": "login"
   }
 }
@@ -449,7 +453,7 @@ When a credential provider is configured for a registry, `npm logout` delegates 
 
 ```json
 {
-  "v": 1,
+  "versions": [1],
   "kind": "logout",
   "registry": "https://registry.example.com/",
   "logLevel": "info",
@@ -462,7 +466,7 @@ When a credential provider is configured for a registry, `npm logout` delegates 
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `v` | integer | yes | Protocol version. |
+| `versions` | array of integers | yes | Supported protocol versions in preference order; same negotiation rules as `get`. |
 | `kind` | string | yes | Must be `"logout"`. |
 | `registry` | string | yes | Target registry base URI. |
 | `logLevel` | string | yes | Current npm log verbosity. |
@@ -476,6 +480,7 @@ Response on success:
 ```json
 {
   "Ok": {
+    "v": 1,
     "kind": "logout"
   }
 }
@@ -516,15 +521,13 @@ On failure, the provider responds with an `Err` object:
 
 | Error kind | Meaning | npm behavior |
 |------------|---------|--------------|
-| `"url-not-supported"` | Provider does not handle this registry. | Skip to next provider in the configured list. If all providers return this: `get`/`logout` fall back to legacy auth with warning; `login` hard-fails. |
-| `"version-not-supported"` | Provider does not support the declared protocol version. | Hard-fail with actionable guidance (update provider). No retry with lower version. |
-| `"operation-not-supported"` | Provider does not support this request kind. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
-| `"other"` | Generic error. | `get`/`logout`: fall back to legacy auth with warning. `login`: hard-fail — no fallback. |
+| `"url-not-supported"` | Provider does not handle this registry. | Try the next provider. If all providers return this, `get` and `logout` fall back to legacy behavior with a warning; `login` fails. |
+| `"version-not-supported"` | Provider supports none of the offered versions. | Fail with update guidance. |
+| `"operation-not-supported"` | Provider does not support this request kind. | `logout` falls back with a warning; `get` and `login` fail. |
+| `"other"` | Generic error. | `logout` falls back with a warning; `get` and `login` fail. |
 
-Fields:
-- `kind` (string, required): Error category.
-- `message` (string, required): Human-readable, suitable for display.
-  Must not contain tokens, passwords, or PII.
+`kind` and `message` are required strings.
+`message` must be human-readable and contain no secrets or PII.
 
 #### Timeout and retry
 
@@ -537,7 +540,7 @@ Users can override the default with `credentialProviderTimeoutMs` in user/global
 
 **Auth failure retry flow:**
 
-When npm receives HTTP 401, 403, or a similar auth failure from a registry:
+When a request carrying cached provider credentials receives HTTP `401` or `403` from a registry:
 
 1. npm evicts all in-memory cached credentials for that registry (all permission variants).
 2. npm spawns the provider with a new `get` request with `retry: true`.
@@ -545,8 +548,8 @@ When npm receives HTTP 401, 403, or a similar auth failure from a registry:
 3. If the provider returns new credentials, npm retries the failed registry request.
 4. If the registry rejects again, npm fails the command — no further retries.
 
-Retrying on both 401 and 403 improves on NuGet's credential provider protocol, which only retries on 401.
-A 403 can indicate the token is valid but lacks required claims (e.g. MFA, device compliance) that a re-authentication could satisfy.
+Both statuses trigger initial acquisition and refresh; a `403` may indicate missing claims that re-authentication can satisfy.
+For non-replayable request bodies, npm acquires credentials before the request.
 
 **Retry limits:**
 - Max 1 retry per auth failure per registry.
