@@ -49,8 +49,6 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 - Support short-lived tokens without manual rotation.
 - Support scoped registries and multiple registry configurations.
 - Support third-party registry authentication using npm CLI and third-party credential providers.
-- Preserve npm trusted publishing as the preferred authentication path for supported publish operations.
-- Invoke credential providers only when a registry proves that authentication is required.
 - Prefer configured credential providers over legacy credentials for the same registry.
 
 ### Non-Goals
@@ -65,15 +63,14 @@ A standardized credential provider protocol fixes this at the tooling layer and 
 ## Detailed Explanation
 
 The proposed plugin protocol defines a standard interface for external credential providers that can be invoked by the NPM CLI during authentication workflows.
-When a registry request receives an HTTP `401` or `403` authentication failure, the CLI invokes a configured credential provider at runtime and receives credentials in response.
+When a registry request receives an authentication failure to a registry, if a credential provider is configured for that registry, the cli invoked the plugin at runtime and receives credentials in response.
 This design avoids persisting tokens in `.npmrc` or relying on environment variables as a long-term secret store.
 When configured for a registry, providers are authoritative; npm uses legacy credentials only if every provider reports that the URL is unsupported and fails on other provider errors.
 
 ### How it works (high level)
 
 1. **Registry request requires auth**: npm receives HTTP `401` or `403` from a registry request.
-2. **Plugin discovery**: npm finds and resolves the ordered list of credential providers configured for the target registry.
-   This happens once per registry per command, regardless of how many workspace members need that registry.
+2. **Plugin discovery**: npm finds and resolves the ordered list of credential providers configured for the target registry from the user or global config.
 3. **Invoke provider**: npm spawns the first provider as a child process, writes a JSON request to `stdin`, then closes the write end (sends EOF).
   The provider writes a JSON response to `stdout`, then exits.
    If the provider returns an error with kind `"url-not-supported"`, npm tries the next provider in the list.
@@ -105,7 +102,7 @@ When configured for a registry, providers are authoritative; npm uses legacy cre
 #### Plugin (credential provider)
 
 - Acquire credentials for the target registry.
-- Own token caching and refresh policy.
+- Own secure token caching and refresh policy.
 - Select the first supported protocol version from the host's ordered `versions` array and echo it as `Ok.v` on success.
 - Ignore unknown request fields (forward compatibility).
 - Return credentials in a structured response shape.
@@ -113,33 +110,21 @@ When configured for a registry, providers are authoritative; npm uses legacy cre
 
 ### Trusted publishing and `npm trust`
 
-Credential providers and trusted publishers solve different authentication problems and are separate extension points.
-A trusted publisher authenticates a CI/CD workload for a specific package and publish operation by exchanging an OIDC identity token with the registry.
-A credential provider supplies conventional registry credentials for requests that require them, including package reads, token-based publishes, and registry-management commands.
-
-For `npm publish` and `npm stage publish`, npm must preserve its existing authentication precedence: when the target registry supports trusted publishing and a supported OIDC environment is available, npm attempts its built-in OIDC exchange before consulting configured credential providers or legacy credentials.
-Credential provider configuration must not disable, replace, or intercept this built-in trusted-publishing path.
-If npm's trusted-publishing implementation proceeds to its existing traditional-auth fallback, the configured credential provider is consulted before legacy credentials.
-OIDC identity tokens, claims, and exchange responses must never be sent to a credential provider.
-
-The `npm trust` command manages the registry-side relationship between a package and a trusted publisher; it does not perform a trusted publish.
-Its registry API calls therefore use the normal credential resolution path.
-When a credential provider is configured for the target registry, `npm trust list` invokes it with a `get` request and `permission: "read-only"`, while commands that create, update, or revoke trust invoke it with `permission: "read-write"`.
-No new `trust` protocol request kind is needed: the provider authenticates the registry request, and npm remains responsible for trust configuration, confirmation prompts, and any registry-required OTP or browser-based proof of presence.
-
-For example, an npm-maintained credential provider for `registry.npmjs.org` would be installed as an executable and selected with the same per-registry `credentialProvider` configuration as any other provider.
-Once configured, `npm trust` would automatically use credentials returned by that provider for its management API calls.
-Adding a new trusted-publisher type to commands such as `npm trust github` is separate from credential acquisition and requires support in the npm CLI and registry, or a future trusted-publisher discovery protocol; installing a credential provider alone must not register new `npm trust` subcommands or teach the registry to validate a new OIDC issuer.
+Credential providers supply registry credentials, while trusted publishers authenticate CI/CD workloads through OIDC; they are separate extension points.
+For `npm publish` and `npm stage publish`, npm attempts supported trusted publishing before credential providers and legacy credentials, and must never send OIDC tokens, claims, or exchange responses to a provider.
+If trusted publishing falls back to traditional authentication, npm consults the configured provider before legacy credentials.
+`npm trust` uses the normal credential path: `list` requests `read-only` permission, while create, update, and revoke operations request `read-write` permission.
+Credential providers add neither a `trust` protocol request kind nor new trusted-publisher types.
 
 ## Rationale and Alternatives
 
-1. **Plaintext `.npmrc` tokens** — Rejected.
+1. **Plaintext `.npmrc` tokens**
    Tokens vulnerable to theft via malware or accidental exposure; violates enterprise security policies.
-2. **Encrypt `.npmrc` tokens locally** — Rejected.
+2. **Encrypt `.npmrc` tokens locally**
    Adds key management and cross-platform complexity; does not solve rotation or dynamic retrieval.
-3. **Environment variables exclusively** — Rejected.
+3. **Environment variables exclusively** 
    Still violates secure storage policies; does not scale for short-lived tokens across dev machines and CI/CD.
-4. **Pipe an ephemeral user config through standard input** — Rejected.
+4. **Pipe an ephemeral user config through standard input**
   On Unix-like systems, this works today:
   ```sh
   provide_npmrc | npm install --userconfig=/dev/stdin
@@ -151,7 +136,7 @@ Adding a new trusted-publisher type to commands such as `npm trust github` is se
   An `install` lifecycle script cannot invoke `npm install` to establish this configuration without recursively triggering itself.
   Users would instead need to define a separately named script or wrapper that runs `provide_npmrc | npm install --userconfig=/dev/stdin`, then remember to use that alternate command instead of the ordinary npm command.
   Requiring application-specific package configuration and a separate command merely to authenticate is an unacceptable user setup burden.
-5. **Require providers as global npm packages** — Rejected.
+5. **Require providers as global npm packages**
   Earlier versions of this proposal configured a global npm package name and resolved its executable from npm's global installation prefix.
   [npm's documentation](https://docs.npmjs.com/downloading-and-installing-packages-globally/) recommends using `npx` to run packages globally rather than relying on global installation.
   `npx` and `npm exec` are also inappropriate for an authentication hook because their resolution may involve project dependencies, npm's cache, or downloading a missing package at invocation time.
@@ -159,7 +144,7 @@ Adding a new trusted-publisher type to commands such as `npm trust github` is se
   Package-name and bin resolution also add ambiguity when packages expose multiple executables and require npm-specific package lookup for an authentication hook that ultimately only needs to spawn a process.
   Configuring an absolute executable path or a bare executable name keeps runtime discovery independent of npm's package installation state, supports native installers and enterprise software deployment, and makes the exact executable visible in user/global `.npmrc`.
   Providers may still be distributed as npm packages, but installing them as project dependencies or executing them from project `node_modules/.bin` is not advised because those locations are project-controlled.
-6. **Shell command registration** — Rejected.
+6. **Shell command registration**
   Providers configured as shell command strings with arguments (e.g. `//<registryHost>:credentialProvider=<command> <arguments>`).
    Drawbacks:
    - Shell injection risk if command string passes through shell parsing.
