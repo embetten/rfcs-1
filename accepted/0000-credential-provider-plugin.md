@@ -192,10 +192,6 @@ If all providers return `"url-not-supported"`:
 - On `login`: npm hard-fails — no fallback.
   Falling back would persist a plaintext token to `.npmrc`.
 
-npm does not cache which provider succeeded for a given registry; providers are tried in order on every npm command.
-This matches Cargo's credential provider model.
-Provider-side token caching ensures the successful provider returns near-instantly on subsequent invocations, so the cost of re-trying the list is negligible in practice.
-
 Example:
 
 ```ini
