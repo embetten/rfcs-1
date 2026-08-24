@@ -13,6 +13,7 @@
 - [Rationale and Alternatives](#rationale-and-alternatives)
 - [Implementation](#implementation)
   - [Plugin Discovery](#plugin-discovery)
+  - [Provider Process Environment](#provider-process-environment)
   - [Protocol](#protocol)
     - [Request kinds](#request-kinds)
     - [`get` request](#get-request)
@@ -221,6 +222,14 @@ Adding an executable reference to user/global `.npmrc` **is** the trust decision
 npm does not install, update, or verify the provenance of provider binaries.
 Administrators are responsible for deploying providers and protecting the executable and its containing directory from modification by less-trusted users.
 Absolute paths are recommended for CI and other high-assurance environments because they avoid dependence on mutable `PATH` ordering.
+
+### Provider Process Environment
+
+The provider normally runs under the same user identity as npm and can independently access npm's persisted configuration and files.
+Broader environment filtering offers limited protection and may remove runtime state required by the provider.
+However, npm removes known process-specific secrets unrelated to provider operation, such as `npm_config_otp`.
+This limits unnecessary disclosure but does not sandbox the provider or create a security boundary.
+High-assurance callers should use an absolute provider path and launch npm with a curated environment.
 
 ### Protocol
 
