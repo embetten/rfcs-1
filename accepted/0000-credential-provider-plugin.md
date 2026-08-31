@@ -655,6 +655,8 @@ The goal is to eliminate **persistent** plaintext storage (`.npmrc` files, envir
 
 ## Unresolved Questions and Bikeshedding
 
+- **Multiple providers per registry:** Should v1 support an ordered list of providers, or limit each registry to one executable?
+  Now that configuration directly identifies an executable rather than an npm package, a single-provider model may be sufficient; chaining can be added later if concrete scenarios emerge.
 - **Provider distribution and installation:** Provider distribution, installation, updates, and removal are deferred beyond v1 and remain the provider owner's responsibility.
   Global npm packages remain possible but are discouraged for the reasons in [Rationale and Alternatives](#rationale-and-alternatives); native installers, package managers, and enterprise deployment may be used instead.
   A future RFC may define an npm-managed command for one-line provider installation and registration to mimic the one-line dotnet tool installation experience.
